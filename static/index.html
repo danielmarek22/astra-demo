@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111111">
+  <link rel="icon" href="/static/images/logo.png?v=astra-mark-v2" type="image/png">
+  <title>Astra — Local intelligence, in conversation</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+  <script type="module" src="/static/main.js"></script>
+</head>
+<body>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="Conversations">
+      <a class="brand" href="/" aria-label="Astra Demo home"><img class="brand-mark" src="/static/images/logo.png?v=astra-mark-v2" alt="" width="40" height="40"><span>astra<span class="brand-tag">DEMO</span></span></a>
+      <p class="sidebar-intro">Local intelligence,<br>in conversation.</p>
+      <button id="new-chat" class="new-chat">＋ New conversation</button>
+      <div class="section-label">YOUR WORKSPACE <span id="session-count"></span></div>
+      <nav id="sessions" aria-label="Conversation history"></nav>
+      <div class="sidebar-bottom">
+        <div class="local-indicator"><span></span> Runs on your machine</div>
+        <button id="reset" class="reset-button">↺ Restore sample workspace</button>
+        <p>Changes last for this server run.<br>Restart or reset to begin again.</p>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div><span class="eyebrow">ASTRA DEMO</span><h1 id="conversation-title">A little context goes a long way.</h1></div>
+        <div class="view-switch" role="group" aria-label="Workspace view">
+          <button id="chat-tab" class="active" aria-pressed="true">Conversation</button>
+          <button id="knowledge-tab" aria-pressed="false">Knowledge</button>
+        </div>
+      </header>
+      <div class="sample-notice"><span class="notice-dot"></span><span>Fictional examples. Real assistant services. Explore a sample or start a conversation of your own.</span></div>
+      <section id="chat-view" class="chat-view" aria-label="Chat">
+        <div id="welcome" class="welcome">
+          <img class="welcome-mark" src="/static/images/logo.png?v=astra-mark-v2" alt="" width="48" height="48">
+          <div class="eyebrow">A SMALL WINDOW INTO ASTRA</div>
+          <h2>Start with a question.<br>Build on what came before.</h2>
+          <p>Explore how conversation, memory, and revisable beliefs work together. These starting points are yours to continue.</p>
+          <div id="examples" class="examples"></div>
+        </div>
+        <div id="messages" class="messages" role="log" aria-label="Messages"></div>
+        <div class="composer-area">
+          <div id="suggestion" class="suggestion" hidden><span>Try asking</span><button id="suggestion-text"></button></div>
+          <section id="approval" class="approval" role="region" aria-label="Command approval" aria-live="polite" hidden>
+            <strong id="approval-title"></strong><p id="approval-reason"></p><pre id="approval-command"></pre>
+            <p>Commands run on this computer using Astra’s existing approval rules.</p>
+            <button id="deny-command" type="button">Deny</button> <button id="approve-command" type="button">Approve once</button>
+          </section>
+          <div id="screen-preview" class="screen-preview" hidden>
+            <video id="screen-video" muted playsinline></video>
+            <label><input id="include-screen" type="checkbox"> Include a screen frame with the next message</label>
+          </div>
+          <div id="draft-attachments" class="draft-attachments" aria-label="Images to send"></div>
+          <div class="media-controls">
+            <button id="record" type="button" aria-pressed="false">Dictate</button>
+            <button id="share-screen" type="button" aria-pressed="false">Share screen</button>
+            <button id="attach-image" type="button">Attach image</button>
+            <input id="image-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+            <label><input id="speak-replies" type="checkbox"> Speak replies · English</label>
+            <button id="resume-voice" type="button">Resume voice</button>
+            <button id="stop-voice" type="button">Stop voice</button>
+          </div>
+          <div id="voice-status" class="voice-status" role="status" aria-live="polite"></div>
+          <form id="composer" class="composer">
+            <label class="sr-only" for="message-input">Your message</label>
+            <textarea id="message-input" placeholder="Ask a question, make a plan, or pick up a thread…" rows="2" maxlength="16000"></textarea>
+            <button id="send" type="submit" aria-label="Send message">↑</button>
+          </form>
+          <div class="composer-meta"><span id="status" role="status" aria-live="polite">Connecting to your workspace…</span><span id="model"></span></div>
+        </div>
+      </section>
+      <section id="knowledge-view" class="knowledge-view" aria-label="Knowledge" hidden>
+        <div class="knowledge-heading"><div class="eyebrow">CONTEXT YOU CAN INSPECT</div><h2>What’s remembered.<br>What’s believed.</h2><p>Saved memories preserve decisions and events. Beliefs track reported facts and their corrections.</p></div>
+        <div class="knowledge-tabs" role="group" aria-label="Knowledge type"><button data-kind="memories" class="active">Saved memories</button><button data-kind="beliefs">Belief records</button><button data-kind="context">Current belief context</button></div>
+        <div id="knowledge-records" aria-live="polite"></div>
+      </section>
+      <div id="error" class="error-banner" role="alert" hidden></div>
+    </main>
+  </div>
+</body>
+</html>

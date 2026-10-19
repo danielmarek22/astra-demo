@@ -1,0 +1,6 @@
+# Migrated Whisper backend plus the demo's stock English voice.
+faster-whisper==1.2.1
+kokoro==0.9.4
+soundfile==0.13.1
+# faster-whisper 1.2.1 uses av.open(metadata_errors=...), removed in PyAV 19.
+av==16.1.0

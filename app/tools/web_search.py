@@ -1,0 +1,179 @@
+import requests
+import logging
+import time
+
+from app.logging import trace_event
+
+logger = logging.getLogger(__name__)
+
+
+class WebSearchResult:
+    def __init__(self, title: str, url: str, content: str):
+        self.title = title
+        self.url = url
+        self.content = content
+
+
+class SearXNGClient:
+    """
+    Low-level HTTP client for SearXNG.
+    Responsible only for talking to the service.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8080",
+        timeout: float = 10.0,
+        max_retries: int = 2,
+        retry_backoff_s: float = 0.25,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_backoff_s = retry_backoff_s
+        self.is_available: bool = False
+
+    def probe(self) -> bool:
+        """
+        Check whether the SearXNG instance is reachable.
+        This should be called once at startup.
+        """
+        trace_event("web_search", "probe_start", payload={"base_url": self.base_url})
+        try:
+            requests.get(
+                f"{self.base_url}/search",
+                params={"q": "ping", "format": "json"},
+                timeout=2.0,
+            )
+            self.is_available = True
+        except Exception:
+            self.is_available = False
+
+        trace_event(
+            "web_search",
+            "probe_result",
+            payload={"base_url": self.base_url, "is_available": self.is_available},
+        )
+        return self.is_available
+
+    def search(self, query: str, limit: int = 5) -> list[WebSearchResult]:
+        params = {
+            "q": query,
+            "format": "json",
+        }
+        trace_event("web_search", "search_request", payload={"params": params, "limit": limit})
+
+        response = self._get_with_retry(
+            f"{self.base_url}/search",
+            params=params,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        results = []
+
+        for r in data.get("results", [])[:limit]:
+            results.append(
+                WebSearchResult(
+                    title=r.get("title", ""),
+                    url=r.get("url", ""),
+                    content=r.get("content", ""),
+                )
+            )
+
+        trace_event(
+            "web_search",
+            "search_results",
+            payload=[
+                {"title": result.title, "url": result.url, "content": result.content}
+                for result in results
+            ],
+        )
+        return results
+
+    def _get_with_retry(self, url: str, params: dict):
+        attempts = self.max_retries + 1
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                return response
+
+            except requests.RequestException as exc:
+                retryable = self._is_retryable(exc)
+                is_last = attempt == attempts
+
+                if is_last or not retryable:
+                    raise
+
+                backoff = self.retry_backoff_s * (2 ** (attempt - 1))
+                logger.warning(
+                    "Web search request failed (attempt %d/%d): %s. Retrying in %.2fs",
+                    attempt,
+                    attempts,
+                    exc,
+                    backoff,
+                )
+                time.sleep(backoff)
+
+        raise RuntimeError("unreachable")
+
+    def _is_retryable(self, exc: requests.RequestException) -> bool:
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            return True
+
+        if isinstance(exc, requests.HTTPError):
+            status_code = getattr(exc.response, "status_code", None)
+            return status_code is not None and status_code >= 500
+
+        return False
+
+class WebSearchTool:
+    """
+    Orchestrator-facing tool adapter.
+    Wraps the client and summarizer into a single optional tool.
+    """
+
+    name = "web_search"
+    description = "Search the internet for current events, facts, or real-time information."
+    
+    # Native Ollama JSON Schema parameters
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The specific search query to execute"
+            }
+        },
+        "required": ["query"]
+    }
+
+    def __init__(self, client: SearXNGClient, summarizer, max_results: int = 5):
+        self.client = client
+        self.summarizer = summarizer
+        self.max_results = max_results
+
+    @property
+    def is_available(self) -> bool:
+        return self.client.is_available
+
+    def run(self, query: str) -> str | None:
+        """
+        Execute the web search and return a summarized context string.
+        Raises on unexpected failure (orchestrator handles it).
+        """
+        trace_event("web_search", "tool_run", payload={"query": query})
+        results = self.client.search(query, limit=self.max_results)
+        summary = self.summarizer.summarize(results)
+        trace_event("web_search", "tool_summary", payload={"summary": summary})
+
+        if not summary:
+            return None
+
+        return f"External information:\n{summary}"

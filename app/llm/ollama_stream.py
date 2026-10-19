@@ -1,0 +1,1028 @@
+import requests
+import json
+import time
+import logging
+import uuid
+from typing import Iterator
+
+from . import image_fallback
+from .base import InferenceFailure, LLMClient
+from .stream_decoder import decode_buffered_chunk, decode_chunk
+from app.llm.thinking_filter import ThinkingBlockSplitter
+from app.logging import trace_event, trace_thinking_output
+
+logger = logging.getLogger("ollama_client")
+
+# Default repetition penalty applied when the caller has not set one.
+_DEFAULT_REPEAT_PENALTY = 1.15
+
+# Maximum temperature allowed for streaming responses. If the configured
+# value exceeds this cap it is clamped down, not replaced with a hardcoded 1.
+_MAX_STREAM_TEMPERATURE = 1.5
+
+# Minimum context / prediction window sizes used when thinking is active.
+_THINKING_MIN_CTX = 8192
+_THINKING_MIN_PREDICT = 2048
+
+# Stop sequences appended unconditionally to every streaming request to
+# prevent the model from rambling past a natural end-of-turn token.
+#
+# NOTE: The native /api/chat endpoint does not support OpenAI-style `stop`
+# sequences at the top level; they must be passed inside `options`. See
+# _build_stream_options for where these are injected.
+_BUILTIN_STOP_SEQUENCES = ["<|eot_id|>", "<|im_end|>", "<|end_of_sentence|>"]
+_MAX_BUFFERED_CONTENT_CHARS = 256_000
+_MAX_BUFFERED_THINKING_CHARS = 1_000_000
+_MAX_BUFFERED_TOOL_JSON_CHARS = 128_000
+
+
+class OllamaClient(LLMClient):
+    """
+    Ollama-backed LLM client using the native /api/chat endpoint exclusively.
+
+    Supports both blocking (chat) and streaming (stream_chat) call patterns,
+    as well as multimodal (image) inputs.  Thinking tokens (extended
+    reasoning) are an opt-in feature controlled by `thinking_enabled` and
+    `thinking_level`.
+
+    Call `preload()` after construction if you want the model weights loaded
+    into VRAM before the first real request. This is intentionally not done
+    in __init__ to keep construction side-effect-free and easy to test.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        host: str,
+        options: dict | None = None,
+        thinking_enabled: bool = False,
+        thinking_level: str | None = None,
+        thinking_options: dict | None = None,
+        timeout_s: float = 30.0,
+        max_retries: int = 2,
+        retry_backoff_s: float = 0.25,
+        telemetry=None,
+    ):
+        self.model = model
+        self._preload_url = f"{host}/api/generate"
+        self._show_url = f"{host}/api/show"
+        self._ps_url = f"{host}/api/ps"
+        self.url = f"{host}/api/chat"
+        self.options = options or {}
+        self.thinking_enabled = thinking_enabled
+        self.thinking_level = thinking_level
+        self.thinking_options = thinking_options or {}
+        self.timeout_s = timeout_s
+        self.max_retries = max_retries
+        self.retry_backoff_s = retry_backoff_s
+        self.telemetry = telemetry
+        self._multimodal_supported = True
+        self.last_chat_dropped_current_images = False
+        self.last_chat_dropped_current_images_count = 0
+        self.last_chat_image_fallback_strategy: str | None = None
+        self.last_stream_dropped_current_images = False
+        self.last_stream_dropped_current_images_count = 0
+        self.last_stream_image_fallback_strategy: str | None = None
+
+        # Reuse a single TCP connection across all requests.
+        self.session = requests.Session()
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def preload(self) -> None:
+        """
+        Warm the model into VRAM so the first real request has no cold-start
+        latency. Call this explicitly after construction when desired; it is
+        NOT called automatically in __init__.
+        """
+        logger.info("Preloading %s into VRAM…", self.model)
+        try:
+            self.session.post(
+                self._preload_url,
+                json={"model": self.model, "keep_alive": "-1"},
+                timeout=30,
+            )
+            logger.info("Model preloaded successfully.")
+        except Exception as exc:
+            logger.warning("Failed to preload model: %s", exc)
+
+    def load_telemetry_metadata(self) -> None:
+        """Best-effort model metadata lookup used only by full telemetry."""
+        if self.telemetry is None or not getattr(self.telemetry, "full", False):
+            return
+        try:
+            response = self.session.post(
+                self._show_url,
+                json={"model": self.model},
+                timeout=min(self.timeout_s, 30.0),
+            )
+            response.raise_for_status()
+            data = response.json()
+            details = data.get("details", {}) if isinstance(data, dict) else {}
+            quantization = details.get("quantization_level") if isinstance(details, dict) else None
+            self.telemetry.set_model_metadata(quantization=quantization)
+        except Exception as exc:
+            logger.warning("Unable to read Ollama model metadata for telemetry: %s", exc)
+
+    def close(self) -> None:
+        self.session.close()
+
+    # ------------------------------------------------------------------
+    # LLMClient interface
+    # ------------------------------------------------------------------
+
+    def chat(
+        self,
+        messages,
+        think_override=None,
+        options_override: dict | None = None,
+        timeout_override: float | None = None,
+        max_retries_override: int | None = None,
+        tools: list[dict] | None = None,
+        format_override: dict | str | None = None,
+        telemetry_session_id: str | None = None,
+    ) -> dict:
+        """
+        Blocking, non-streaming call.
+        Used for summarizers, classifiers, and other structured workflows.
+
+        `options_override` is merged on top of instance defaults per-call
+        without mutating them. Streaming calls merge overrides after applying
+        their mode-specific generation defaults.
+        """
+        trace_context = self._new_trace_context("blocking", telemetry_session_id)
+        think_value = self._resolve_think_value(think_override)
+
+        request_options = self.options.copy()
+        if options_override:
+            request_options.update(options_override)
+
+        fallback = image_fallback.ImageFallback(
+            messages, multimodal_supported=self._multimodal_supported,
+        )
+        self.last_chat_dropped_current_images = False
+        self.last_chat_dropped_current_images_count = 0
+        self.last_chat_image_fallback_strategy = None
+
+        payload = self._build_payload(
+            fallback.attempt.messages,
+            stream=False,
+            think_value=think_value,
+            options=request_options,
+            tools=tools,
+            format_override=format_override,
+        )
+
+        logger.info(
+            "Ollama chat request (stream=False, think=%r, messages=%d)",
+            think_value,
+            len(messages),
+        )
+        trace_event("llm", "chat_request", session_id=telemetry_session_id, payload={
+            **trace_context, "message_count": len(messages), "effective_think": think_value,
+        })
+
+        request_started = time.perf_counter()
+        while True:
+            try:
+                r = self._post_with_retry(
+                    payload,
+                    stream=False,
+                    timeout_override=timeout_override,
+                    max_retries_override=image_fallback.resolve_request_retries(
+                        fallback.attempt.messages,
+                        max_retries_override,
+                    ),
+                    trace_context=trace_context,
+                )
+                break
+            except requests.HTTPError as exc:
+                payload["messages"] = self._next_image_attempt(fallback, exc, mode="chat").messages
+            except requests.RequestException as exc:
+                raise self._inference_failure(exc) from exc
+
+        self.last_chat_image_fallback_strategy = fallback.attempt.strategy
+        self.last_chat_dropped_current_images_count = fallback.attempt.dropped_current_images_count
+        self.last_chat_dropped_current_images = fallback.attempt.dropped_current_images_count > 0
+
+        try:
+            data = r.json()
+        except (TypeError, ValueError) as exc:
+            raise InferenceFailure(
+                "malformed_response",
+                "Ollama returned malformed JSON for a completed generation.",
+            ) from exc
+        if not isinstance(data, dict) or not isinstance(data.get("message", {}), dict):
+            raise InferenceFailure(
+                "malformed_response",
+                "Ollama returned an invalid completed-generation response shape.",
+            )
+        message = data.get("message", {})
+        finish_reason = data.get("done_reason")
+
+        trace_event(
+            "llm",
+            "chat_response",
+            session_id=telemetry_session_id,
+            payload={
+                **trace_context,
+                "content": message.get("content"),
+                "thinking_chars_received": len(message.get("thinking") or ""),
+                "done_reason": finish_reason,
+                "http_wall_duration_ms": round(
+                    (time.perf_counter() - request_started) * 1000, 2
+                ),
+                "ollama_total_duration_ms": self._nanoseconds_to_ms(data.get("total_duration")),
+                "ollama_load_duration_ms": self._nanoseconds_to_ms(data.get("load_duration")),
+                "ollama_prompt_eval_duration_ms": self._nanoseconds_to_ms(
+                    data.get("prompt_eval_duration")
+                ),
+                "ollama_generation_duration_ms": self._nanoseconds_to_ms(
+                    data.get("eval_duration")
+                ),
+                "prompt_eval_count": data.get("prompt_eval_count"),
+                "generation_token_count": data.get("eval_count"),
+            },
+        )
+        trace_thinking_output(message.get("thinking"), **trace_context)
+
+        self._record_telemetry(
+            data,
+            started=request_started,
+            request_options=request_options,
+            call_mode="blocking",
+            phase="blocking",
+            telemetry_session_id=telemetry_session_id,
+        )
+
+        return message
+
+    def chat_buffered(
+        self,
+        messages,
+        think_override=None,
+        options_override: dict | None = None,
+        timeout_override: float | None = None,
+        generation_deadline_s: float | None = 120.0,
+        tools: list[dict] | None = None,
+        generation_phase: str | None = None,
+        react_iteration: int | None = None,
+        telemetry_session_id: str | None = None,
+    ) -> dict:
+        """Consume a native streamed generation atomically before exposing its result."""
+        trace_context = self._new_trace_context(
+            "buffered", telemetry_session_id,
+            generation_phase=generation_phase, react_iteration=react_iteration,
+        )
+        think_value = self._resolve_think_value(think_override)
+        request_options = self._build_stream_options(think_value)
+        request_options = self._merge_options(request_options, options_override)
+        payload = self._build_payload(
+            messages,
+            stream=True,
+            think_value=think_value,
+            options=request_options,
+            tools=tools,
+        )
+        logger.info(
+            "Ollama buffered chat request (stream=True, think=%r, messages=%d)",
+            think_value,
+            len(messages),
+        )
+        effective_num_predict = request_options.get("num_predict")
+        trace_event("llm", "chat_request", session_id=telemetry_session_id, payload={
+            **trace_context,
+            "buffered": True,
+            "generation_phase": generation_phase,
+            "react_iteration": react_iteration,
+            "effective_think": think_value,
+            "effective_num_predict": effective_num_predict,
+            "tools_exposed": bool(tools),
+            "tool_count": len(tools or []),
+            "message_count": len(messages),
+        })
+
+        started = time.perf_counter()
+        first_chunk_ms = None
+        content_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_calls: list = []
+        content_chars = 0
+        thinking_chars = 0
+        completed = False
+        final_chunk: dict = {}
+        try:
+            with self._post_stream(
+                payload, timeout_override=timeout_override, trace_context=trace_context,
+            ) as response:
+                for line in response.iter_lines():
+                    now = time.perf_counter()
+                    if generation_deadline_s is not None and now - started > generation_deadline_s:
+                        raise InferenceFailure(
+                            "generation_deadline",
+                            "Ollama buffered generation exceeded its total deadline.",
+                        )
+                    if not line:
+                        continue
+                    chunk = decode_buffered_chunk(line)
+                    message = chunk.get("message", {})
+                    content = message.get("content") or ""
+                    thinking = message.get("thinking") or ""
+                    if first_chunk_ms is None and (
+                        content or thinking or message.get("tool_calls")
+                    ):
+                        first_chunk_ms = round((now - started) * 1000, 2)
+                    if not isinstance(content, str) or not isinstance(thinking, str):
+                        raise InferenceFailure(
+                            "malformed_response",
+                            "Ollama streamed non-text content or thinking data.",
+                        )
+                    content_chars += len(content)
+                    thinking_chars += len(thinking)
+                    if content_chars > _MAX_BUFFERED_CONTENT_CHARS:
+                        raise InferenceFailure(
+                            "malformed_response", "Ollama content exceeded the bounded buffer."
+                        )
+                    if thinking_chars > _MAX_BUFFERED_THINKING_CHARS:
+                        raise InferenceFailure(
+                            "malformed_response", "Ollama thinking exceeded the bounded buffer."
+                        )
+                    content_parts.append(content)
+                    thinking_parts.append(thinking)
+                    chunk_tool_calls = message.get("tool_calls")
+                    if chunk_tool_calls is not None:
+                        if not isinstance(chunk_tool_calls, list):
+                            raise InferenceFailure(
+                                "malformed_response", "Ollama streamed invalid tool-call data."
+                            )
+                        tool_calls.extend(chunk_tool_calls)
+                        if len(json.dumps(tool_calls, ensure_ascii=True)) > _MAX_BUFFERED_TOOL_JSON_CHARS:
+                            raise InferenceFailure(
+                                "malformed_response", "Ollama tool calls exceeded the bounded buffer."
+                            )
+                    if chunk.get("done"):
+                        completed = True
+                        final_chunk = chunk
+                        break
+        except InferenceFailure:
+            raise
+        except requests.RequestException as exc:
+            raise self._inference_failure(exc) from exc
+        except Exception as exc:
+            raise InferenceFailure(
+                "malformed_response",
+                f"Ollama buffered stream failed: {type(exc).__name__}",
+            ) from exc
+
+        if not completed:
+            raise InferenceFailure(
+                "malformed_response",
+                "Ollama stream ended before a completed generation marker.",
+            )
+        message = {
+            "content": "".join(content_parts),
+            "thinking": "".join(thinking_parts),
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        trace_event(
+            "llm",
+            "chat_response",
+            session_id=telemetry_session_id,
+            payload={
+                **trace_context,
+                "buffered": True,
+                "generation_phase": generation_phase,
+                "react_iteration": react_iteration,
+                "effective_think": think_value,
+                "effective_num_predict": effective_num_predict,
+                "tools_exposed": bool(tools),
+                "tool_count": len(tools or []),
+                "tool_call_count": len(tool_calls),
+                "content_chars": len(message["content"]),
+                "thinking_chars_received": min(
+                    len(message["thinking"]), _MAX_BUFFERED_THINKING_CHARS
+                ),
+                "thinking_token_count": final_chunk.get("thinking_count"),
+                "done_reason": final_chunk.get("done_reason"),
+                "time_to_first_chunk_ms": first_chunk_ms,
+                "total_duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "ollama_load_duration_ms": self._nanoseconds_to_ms(final_chunk.get("load_duration")),
+                "ollama_prompt_eval_duration_ms": self._nanoseconds_to_ms(
+                    final_chunk.get("prompt_eval_duration")
+                ),
+                "prompt_eval_count": final_chunk.get("prompt_eval_count"),
+                "ollama_generation_duration_ms": self._nanoseconds_to_ms(
+                    final_chunk.get("eval_duration")
+                ),
+                "generation_token_count": final_chunk.get("eval_count"),
+            },
+        )
+        trace_thinking_output(message["thinking"], **trace_context)
+        self._record_telemetry(
+            final_chunk,
+            started=started,
+            request_options=request_options,
+            time_to_first_token_ms=first_chunk_ms,
+            call_mode="buffered",
+            phase=generation_phase or "buffered",
+            react_iteration=react_iteration,
+            telemetry_session_id=telemetry_session_id,
+        )
+        return message
+
+    def stream_chat(
+        self, 
+        messages, 
+        think_override=None, 
+        tools: list[dict] | None = None,
+        options_override: dict | None = None,
+        generation_deadline_s: float | None = None,
+        timeout_override: float | None = None,
+        telemetry_session_id: str | None = None,
+    ) -> Iterator[str | dict]:
+        """
+        Streaming call. Yields text chunks for user-facing responses.
+
+        Thinking tokens are wrapped in <think>…</think> and yielded inline
+        so the orchestrator can process or strip them downstream.
+        """
+        trace_context = self._new_trace_context("streaming", telemetry_session_id)
+        think_value = self._resolve_think_value(think_override)
+        request_options = self._build_stream_options(think_value)
+        request_options = self._merge_options(request_options, options_override)
+        fallback = image_fallback.ImageFallback(
+            messages, multimodal_supported=self._multimodal_supported,
+        )
+        self.last_stream_dropped_current_images = False
+        self.last_stream_dropped_current_images_count = 0
+        self.last_stream_image_fallback_strategy = None
+
+        payload = self._build_payload(
+            fallback.attempt.messages,
+            stream=True,
+            think_value=think_value,
+            options=request_options,
+            tools=tools,
+        )
+
+        logger.info(
+            "Ollama chat request (stream=True, think=%r, messages=%d)",
+            think_value,
+            len(messages),
+        )
+        trace_event("llm", "stream_request", session_id=telemetry_session_id, payload={
+            **trace_context, "message_count": len(messages), "effective_think": think_value,
+        })
+
+        collected_content: list[str] = []
+        collected_thinking: list[str] = []
+        while True:
+            try:
+                stream_result = yield from self._stream_payload(
+                    payload,
+                    collected_content,
+                    collected_thinking,
+                    generation_deadline_s=generation_deadline_s,
+                    timeout_override=timeout_override,
+                    trace_context=trace_context,
+                )
+                break
+            except requests.HTTPError as exc:
+                payload["messages"] = self._next_image_attempt(fallback, exc, mode="stream").messages
+            except requests.RequestException as exc:
+                if fallback.attempt.strategy is not None:
+                    # Keep the existing fallback-stream exception contract.
+                    raise
+                raise self._inference_failure(exc) from exc
+
+        self.last_stream_image_fallback_strategy = fallback.attempt.strategy
+        self.last_stream_dropped_current_images_count = fallback.attempt.dropped_current_images_count
+        self.last_stream_dropped_current_images = fallback.attempt.dropped_current_images_count > 0
+
+        logger.info(
+            "Ollama stream complete (content_len=%d, thinking_len=%d)",
+            len("".join(collected_content)),
+            len("".join(collected_thinking)),
+        )
+        trace_event(
+            "llm",
+            "stream_response",
+            session_id=telemetry_session_id,
+            payload={
+                **trace_context,
+                "content": "".join(collected_content),
+                "thinking_chars_received": sum(map(len, collected_thinking)),
+            },
+        )
+        trace_thinking_output("".join(collected_thinking), **trace_context)
+        if stream_result is not None:
+            self._record_telemetry(
+                stream_result["final_chunk"],
+                started=stream_result["started"],
+                request_options=request_options,
+                time_to_first_token_ms=stream_result["time_to_first_token_ms"],
+                call_mode="streaming",
+                phase="response",
+                telemetry_session_id=telemetry_session_id,
+            )
+
+    def _next_image_attempt(
+        self,
+        fallback: image_fallback.ImageFallback,
+        exc: requests.HTTPError,
+        *,
+        mode: str,
+    ) -> image_fallback.ImageAttempt:
+        try:
+            attempt = fallback.retry(exc)
+        finally:
+            self._multimodal_supported = fallback.multimodal_supported
+        if attempt is None:
+            raise self._inference_failure(exc) from exc
+        status_code = getattr(exc.response, "status_code", None)
+        logger.warning(
+            "Ollama %s rejected image payload (status=%s); retrying %s.",
+            mode, status_code, attempt.strategy,
+        )
+        trace_event(
+            "llm", f"{mode}_retry_without_images",
+            payload={
+                "status_code": status_code,
+                "response_text": image_fallback.http_error_text(exc),
+                "strategy": attempt.strategy,
+                "dropped_current_images_count": attempt.dropped_current_images_count,
+            },
+        )
+        return attempt
+
+    # ------------------------------------------------------------------
+    # Private — streaming
+    # ------------------------------------------------------------------
+
+    def _stream_payload(
+        self,
+        payload: dict,
+        collected_content: list[str],
+        collected_thinking: list[str],
+        generation_deadline_s: float | None = None,
+        timeout_override: float | None = None,
+        trace_context: dict | None = None,
+    ) -> Iterator[str | dict]:
+        """
+        Consume a streaming response from /api/chat (native NDJSON format).
+        """
+        in_thinking_block = False
+
+        started = time.perf_counter()
+        first_token_ms = None
+        final_chunk: dict = {}
+        with self._post_stream(
+            payload, timeout_override=timeout_override, trace_context=trace_context,
+        ) as r:
+            for line in r.iter_lines():
+                if generation_deadline_s is not None and time.perf_counter() - started > generation_deadline_s:
+                    raise InferenceFailure(
+                        "generation_deadline",
+                        "Ollama streamed generation exceeded its total deadline.",
+                    )
+                if not line:
+                    continue
+
+                chunk = decode_chunk(line)
+                message = chunk.get("message", {})
+                content = message.get("content")
+                thinking = message.get("thinking")
+                
+                # Intercept native tool calls and yield as a dict
+                tool_calls = message.get("tool_calls")
+                if first_token_ms is None and (content or thinking or tool_calls):
+                    first_token_ms = round((time.perf_counter() - started) * 1000, 2)
+                if tool_calls:
+                    yield {"tool_calls": tool_calls}
+
+                if thinking:
+                    if not in_thinking_block:
+                        yield "<think>\n"
+                        in_thinking_block = True
+                    collected_thinking.append(thinking)
+                    yield thinking
+
+                if content and in_thinking_block:
+                    yield "\n</think>\n\n"
+                    in_thinking_block = False
+
+                if content:
+                    collected_content.append(content)
+                    yield content
+
+                if chunk.get("done"):
+                    final_chunk = chunk
+                    if in_thinking_block:
+                        yield "\n</think>\n\n"
+                    if chunk.get("done_reason") == "length":
+                        logger.warning(
+                            "Ollama stream hit the token limit (num_predict) "
+                            "before finishing — response may be truncated."
+                        )
+                    break
+        return {
+            "final_chunk": final_chunk,
+            "started": started,
+            "time_to_first_token_ms": first_token_ms,
+        }
+
+    # ------------------------------------------------------------------
+    # Private — request builders
+    # ------------------------------------------------------------------
+
+    def _build_payload(
+        self,
+        messages,
+        stream: bool,
+        think_value,
+        options: dict | None = None,
+        tools: list[dict] | None = None,
+        format_override: dict | str | None = None,
+    ) -> dict:
+        """
+        Build a request payload for the native /api/chat endpoint.
+        """
+        if tools and format_override is not None:
+            raise ValueError("Ollama tools and format_override cannot be combined")
+
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+            "stream": stream,
+            "think": think_value,
+        }
+        if options:
+            payload["options"] = self._normalize_options(options)
+            
+        # Natively inject schemas if provided
+        if tools:
+            payload["tools"] = tools
+        if format_override is not None:
+            payload["format"] = format_override
+            
+        return payload
+
+    def _build_stream_options(self, think_value) -> dict:
+        """
+        Build the options dict for a streaming request.
+
+        Applies several safety defaults on top of the instance options:
+        - Applies thinking-specific overrides when thinking is active.
+        - Renames max_tokens → num_predict for the native API.
+        - Clamps temperature to _MAX_STREAM_TEMPERATURE if it exceeds it.
+        - Sets a default repeat_penalty if none is configured.
+        - Appends built-in stop sequences inside options.
+        - Boosts context / prediction limits when thinking is active.
+        """
+        opts = self.options.copy()
+        if think_value:
+            opts = self._merge_options(opts, self.thinking_options)
+
+        opts = self._drop_none_options(opts)
+
+        # Native endpoint uses num_predict, not max_tokens.
+        if "max_tokens" in opts and "num_predict" not in opts:
+            opts["num_predict"] = opts.pop("max_tokens")
+
+        # Default repetition penalty to discourage looping.
+        opts.setdefault("repeat_penalty", _DEFAULT_REPEAT_PENALTY)
+
+        # Clamp temperature — do not silently replace a deliberate value,
+        # just bring it down to the ceiling if it exceeds it.
+        current_temp = opts.get("temperature")
+        if current_temp is None or current_temp > _MAX_STREAM_TEMPERATURE:
+            opts["temperature"] = _MAX_STREAM_TEMPERATURE
+
+        # Merge stop sequences rather than replacing caller-supplied ones.
+        existing_stops = opts.get("stop", [])
+        if isinstance(existing_stops, str):
+            existing_stops = [existing_stops]
+        opts["stop"] = existing_stops + _BUILTIN_STOP_SEQUENCES
+
+        # Expand context window when thinking is active.
+        if think_value:
+            opts["num_ctx"] = max(opts.get("num_ctx", _THINKING_MIN_CTX), _THINKING_MIN_CTX)
+            opts["num_predict"] = max(
+                opts.get("num_predict", _THINKING_MIN_PREDICT), _THINKING_MIN_PREDICT
+            )
+
+        return opts
+
+    def _normalize_options(self, options: dict) -> dict:
+        """
+        Normalise an options dict for the native endpoint:
+        - Drop None values.
+        - Rename max_tokens → num_predict.
+        """
+        normalized = self._drop_none_options(options)
+        if "max_tokens" in normalized and "num_predict" not in normalized:
+            normalized["num_predict"] = normalized.pop("max_tokens")
+        return normalized
+
+    # ------------------------------------------------------------------
+    # Private — HTTP
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _new_trace_context(call_mode: str, session_id: str | None, **fields) -> dict:
+        return {"inference_id": uuid.uuid4().hex, "call_mode": call_mode,
+                "session_id": session_id, **fields}
+
+    @staticmethod
+    def _trace_request_payload(payload: dict, trace_context: dict | None, attempt: int = 1) -> None:
+        context = trace_context or {}
+        trace_event("llm", "request_payload", session_id=context.get("session_id"), payload={
+            **context, "request_id": uuid.uuid4().hex,
+            "transport_attempt": attempt, "request": payload,
+        })
+
+    def _post_stream(self, payload: dict, timeout_override: float | None = None,
+                     trace_context: dict | None = None) -> requests.Response:
+        """
+        Issue a streaming POST to the native chat endpoint. Returns the raw
+        Response used as a context manager so the caller can iterate lines
+        while the connection is open.
+
+        Separated from _post_with_retry because streaming responses cannot be
+        retried transparently — partial output may already have been yielded.
+        """
+        self._trace_request_payload(payload, trace_context)
+        response = self.session.post(
+            self.url,
+            json=payload,
+            stream=True,
+            timeout=(timeout_override if timeout_override is not None else self.timeout_s),
+        )
+        response.raise_for_status()
+        return response
+
+    def _post_with_retry(
+        self,
+        payload: dict,
+        stream: bool,
+        timeout_override: float | None = None,
+        max_retries_override: int | None = None,
+        trace_context: dict | None = None,
+    ) -> requests.Response:
+        """
+        Issue a non-streaming POST with exponential-backoff retry.
+
+        Retries only failures known to happen before request establishment.
+        Once a request may be executing, retrying could duplicate generation.
+        """
+        actual_max_retries = max_retries_override if max_retries_override is not None else self.max_retries
+        attempts = actual_max_retries + 1
+        request_timeout = timeout_override if timeout_override is not None else self.timeout_s
+
+        for attempt in range(1, attempts + 1):
+            attempt_started = time.perf_counter()
+            try:
+                self._trace_request_payload(payload, trace_context, attempt)
+                response = self.session.post(
+                    self.url,
+                    json=payload,
+                    stream=stream,
+                    timeout=request_timeout,
+                )
+                response.raise_for_status()
+                return response
+
+            except requests.RequestException as exc:
+                is_last = attempt == attempts
+                if is_last or not self._is_retryable(exc):
+                    category = self._inference_failure(exc).category
+                    logger.warning(
+                        "Ollama inference request failed category=%s attempt=%d/%d retry=false",
+                        category, attempt, attempts,
+                    )
+                    trace_event("llm", "request_failure",
+                                session_id=(trace_context or {}).get("session_id"), payload={
+                        **(trace_context or {}),
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                        "attempt_duration_ms": round((time.perf_counter() - attempt_started) * 1000, 2),
+                        "error_type": type(exc).__name__,
+                        "error_category": category,
+                        "retry": False,
+                    })
+                    raise
+
+                backoff = self.retry_backoff_s * (2 ** (attempt - 1))
+                trace_event(
+                    "llm",
+                    "request_retry",
+                    session_id=(trace_context or {}).get("session_id"),
+                    payload={
+                        **(trace_context or {}),
+                        "attempt": attempt,
+                        "max_attempts": attempts,
+                        "attempt_duration_ms": round(
+                            (time.perf_counter() - attempt_started) * 1000, 2
+                        ),
+                        "backoff_ms": round(backoff * 1000, 2),
+                        "error_type": type(exc).__name__,
+                        "status_code": getattr(
+                            getattr(exc, "response", None), "status_code", None
+                        ),
+                    },
+                )
+                logger.warning(
+                    "Ollama request failed (attempt %d/%d): %s — retrying in %.2fs",
+                    attempt,
+                    attempts,
+                    exc,
+                    backoff,
+                )
+                time.sleep(backoff)
+
+        raise RuntimeError("unreachable")  # loop always raises or returns
+
+    def _record_telemetry(
+        self,
+        data: dict,
+        *,
+        started: float,
+        request_options: dict,
+        call_mode: str,
+        phase: str,
+        time_to_first_token_ms: float | None = None,
+        react_iteration: int | None = None,
+        telemetry_session_id: str | None = None,
+    ) -> None:
+        if self.telemetry is None or not getattr(self.telemetry, "enabled", False):
+            return
+        http_wall_duration_ms = (time.perf_counter() - started) * 1000
+        prompt_tokens = data.get("prompt_eval_count")
+        completion_tokens = data.get("eval_count")
+        eval_duration_ms = self._nanoseconds_to_ms(data.get("eval_duration"))
+        decode_tokens_per_s = None
+        if completion_tokens is not None and eval_duration_ms:
+            decode_tokens_per_s = float(completion_tokens) / (eval_duration_ms / 1000.0)
+        context_tokens_total = None
+        if prompt_tokens is not None and completion_tokens is not None:
+            context_tokens_total = int(prompt_tokens) + int(completion_tokens)
+        total_model_duration_ms = self._nanoseconds_to_ms(data.get("total_duration"))
+        if total_model_duration_ms is None:
+            total_model_duration_ms = http_wall_duration_ms
+        extended_metrics = {}
+        if getattr(self.telemetry, "extended", False):
+            cached_prompt_tokens = next(
+                (
+                    data.get(key)
+                    for key in (
+                        "cached_prompt_tokens",
+                        "cached_prompt_eval_count",
+                        "prompt_cache_count",
+                    )
+                    if data.get(key) is not None
+                ),
+                None,
+            )
+            extended_metrics = {
+                "model_load_duration_ms": self._nanoseconds_to_ms(
+                    data.get("load_duration")
+                ),
+                "cached_prompt_tokens": cached_prompt_tokens,
+                "actually_evaluated_prompt_tokens": prompt_tokens,
+                **self._extended_runtime_metrics(),
+            }
+
+        self.telemetry.record_model_call(
+            session_id=telemetry_session_id,
+            status="success",
+            call_mode=call_mode,
+            phase=phase,
+            react_iteration=react_iteration,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            prompt_eval_duration_ms=self._nanoseconds_to_ms(
+                data.get("prompt_eval_duration")
+            ),
+            eval_duration_ms=eval_duration_ms,
+            time_to_first_token_ms=time_to_first_token_ms,
+            decode_tokens_per_s=decode_tokens_per_s,
+            total_model_duration_ms=total_model_duration_ms,
+            http_wall_duration_ms=http_wall_duration_ms,
+            context_tokens_total=context_tokens_total,
+            model_name=self.model,
+            num_ctx=request_options.get("num_ctx"),
+            num_gpu_layers=request_options.get("num_gpu"),
+            done_reason=data.get("done_reason"),
+            **extended_metrics,
+        )
+
+    def _extended_runtime_metrics(self) -> dict:
+        defaults = {
+            "ollama_model_vram_bytes": None,
+            "kv_cache_bytes": None,
+            "context_allocation_tokens": None,
+            "active_model_runners": None,
+            "active_contexts": None,
+        }
+        if self.telemetry is None or not getattr(self.telemetry, "extended", False):
+            return defaults
+        try:
+            response = self.session.get(
+                self._ps_url,
+                timeout=min(self.timeout_s, 2.0),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.debug("Unable to read Ollama runtime telemetry: %s", exc)
+            return defaults
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            return defaults
+        runner = next(
+            (
+                item
+                for item in models
+                if isinstance(item, dict)
+                and (item.get("model") == self.model or item.get("name") == self.model)
+            ),
+            None,
+        )
+        active_contexts = None
+        reported_contexts = [
+            item.get("active_contexts")
+            for item in models
+            if isinstance(item, dict) and isinstance(item.get("active_contexts"), int)
+        ]
+        if reported_contexts:
+            active_contexts = sum(reported_contexts)
+        if runner is None:
+            return {**defaults, "active_model_runners": len(models), "active_contexts": active_contexts}
+        kv_cache_bytes = runner.get("kv_cache_bytes")
+        if kv_cache_bytes is None:
+            kv_cache_bytes = runner.get("kv_cache_size")
+        return {
+            "ollama_model_vram_bytes": runner.get("size_vram"),
+            "kv_cache_bytes": kv_cache_bytes,
+            "context_allocation_tokens": runner.get("context_length"),
+            "active_model_runners": len(models),
+            "active_contexts": active_contexts,
+        }
+
+    @staticmethod
+    def _nanoseconds_to_ms(value):
+        if not isinstance(value, (int, float)):
+            return None
+        return round(value / 1_000_000, 2)
+
+    # ------------------------------------------------------------------
+    # Private — utilities
+    # ------------------------------------------------------------------
+
+    def _resolve_think_value(self, think_override):
+        if think_override is not None:
+            return think_override
+        if not self.thinking_enabled:
+            return False
+        return self.thinking_level or True
+
+    def resolve_think_value(self, think_override=None):
+        """Resolve a turn override against this client's configured reasoning setting."""
+        return self._resolve_think_value(think_override)
+
+    def _merge_options(self, base_options: dict, override_options: dict | None) -> dict:
+        merged = dict(base_options)
+        if not override_options:
+            return merged
+        for key, value in override_options.items():
+            if value is None:
+                merged.pop(key, None)
+                continue
+            merged[key] = value
+        return merged
+
+    def _drop_none_options(self, options: dict) -> dict:
+        return {key: value for key, value in options.items() if value is not None}
+
+    def _is_retryable(self, exc: requests.RequestException) -> bool:
+        return isinstance(exc, requests.ConnectTimeout)
+
+    @staticmethod
+    def _inference_failure(exc: requests.RequestException) -> InferenceFailure:
+        if isinstance(exc, requests.ConnectTimeout):
+            category = "connect_timeout"
+        elif isinstance(exc, requests.ReadTimeout):
+            category = "read_timeout"
+        elif isinstance(exc, requests.Timeout):
+            category = "timeout"
+        elif isinstance(exc, requests.HTTPError):
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            category = "server_error" if status is not None and status >= 500 else "http_error"
+        elif isinstance(exc, requests.ConnectionError):
+            category = "connection_error"
+        else:
+            category = "request_error"
+        return InferenceFailure(category, f"Ollama inference failed ({category}).")

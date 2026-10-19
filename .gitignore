@@ -1,0 +1,18 @@
+# Local environments, Python artifacts, and validation caches
+.venv/
+venv_app/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and disposable demo state
+app/config/assistant.yaml
+.demo-state/
+*.db
+*.sqlite3
+
+# Generated documentation and local task metadata
+site/
+/.codex

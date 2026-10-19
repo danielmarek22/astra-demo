@@ -1,0 +1,561 @@
+import unittest
+import time
+from unittest.mock import Mock, patch
+
+import requests
+
+from app.llm.base import InferenceFailure
+from app.llm.ollama_stream import OllamaClient
+from app.tools.web_search import SearXNGClient
+from tests.support import make_response
+
+
+def _ndjson_line(payload: str) -> bytes:
+    return payload.encode("utf-8")
+
+
+class HttpRetryTests(unittest.TestCase):
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_both_modes_record_native_ollama_telemetry_from_terminal_chunk(self, post_mock):
+        post_mock.return_value = make_response(lines=[
+            b'{"message":{"content":"ok"},"done":false}',
+            b'{"message":{},"done":true,"done_reason":"stop","total_duration":9000000,"prompt_eval_count":42,"prompt_eval_duration":2000000,"eval_count":8,"eval_duration":4000000}',
+        ])
+        for buffered in (False, True):
+            with self.subTest(buffered=buffered):
+                telemetry = Mock(enabled=True, full=False)
+                telemetry.extended = False
+                client = OllamaClient(
+                    model="test-model",
+                    host="http://localhost:11434",
+                    options={"num_ctx": 4096, "num_gpu": 20},
+                    telemetry=telemetry,
+                )
+
+                if buffered:
+                    self.assertEqual(client.chat_buffered([{"role": "user", "content": "hello"}])["content"], "ok")
+                else:
+                    self.assertEqual(list(client.stream_chat([{"role": "user", "content": "hello"}])), ["ok"])
+
+                metrics = telemetry.record_model_call.call_args.kwargs
+                self.assertEqual(metrics["prompt_tokens"], 42)
+                self.assertEqual(metrics["completion_tokens"], 8)
+                self.assertEqual(metrics["total_model_duration_ms"], 9.0)
+                self.assertEqual(metrics["decode_tokens_per_s"], 2000.0)
+                self.assertEqual(metrics["context_tokens_total"], 50)
+                self.assertEqual(metrics["num_ctx"], 4096)
+                self.assertEqual(metrics["num_gpu_layers"], 20)
+                self.assertIsNotNone(metrics["time_to_first_token_ms"])
+
+    def test_extended_runtime_metrics_use_ollama_ps(self):
+        telemetry = Mock(enabled=True, full=True, extended=True)
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            telemetry=telemetry,
+        )
+        client.session.get = Mock(return_value=make_response(data={"models": [
+            {
+                "name": "test-model",
+                "model": "test-model",
+                "size_vram": 123456,
+                "context_length": 8192,
+            },
+            {"name": "embedding-model", "model": "embedding-model"},
+        ]}))
+
+        metrics = client._extended_runtime_metrics()
+
+        self.assertEqual(metrics["ollama_model_vram_bytes"], 123456)
+        self.assertEqual(metrics["context_allocation_tokens"], 8192)
+        self.assertEqual(metrics["active_model_runners"], 2)
+        self.assertIsNone(metrics["kv_cache_bytes"])
+        self.assertIsNone(metrics["active_contexts"])
+
+        client._record_telemetry(
+            {
+                "load_duration": 3_000_000,
+                "prompt_eval_count": 42,
+                "prompt_eval_duration": 2_000_000,
+                "eval_count": 8,
+                "eval_duration": 4_000_000,
+                "total_duration": 9_000_000,
+            },
+            started=time.perf_counter(),
+            request_options={"num_ctx": 8192},
+            call_mode="streaming",
+            phase="response",
+        )
+        recorded = telemetry.record_model_call.call_args.kwargs
+        self.assertEqual(recorded["model_load_duration_ms"], 3.0)
+        self.assertEqual(recorded["actually_evaluated_prompt_tokens"], 42)
+        self.assertIsNone(recorded["cached_prompt_tokens"])
+
+    @patch("app.llm.ollama_stream.trace_event")
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_buffered_chat_waits_for_complete_tool_call_and_tool_wins_content(
+        self, post_mock, trace_mock
+    ):
+        post_mock.return_value = make_response(lines=[
+            b'{"message":{"thinking":"brief"},"done":false}',
+            b'{"message":{"content":"discard me","tool_calls":[{"function":{"name":"beliefs__update","arguments":{"assertions":[],"invalidations":[]}}}]},"done":false}',
+            b'{"message":{},"done":true,"done_reason":"stop","prompt_eval_count":42,"prompt_eval_duration":2000000,"eval_count":8,"eval_duration":3000000}',
+        ])
+        client = OllamaClient(model="test-model", host="http://localhost:11434")
+        message = client.chat_buffered(
+            [{"role": "user", "content": "hello"}],
+            think_override=False,
+            options_override={"num_predict": 512},
+            tools=[{"type": "function", "function": {"name": "beliefs__update"}}],
+            generation_phase="correction",
+            react_iteration=2,
+        )
+        self.assertEqual(message["content"], "discard me")
+        self.assertEqual(message["thinking"], "brief")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "beliefs__update")
+        payload = post_mock.call_args.kwargs["json"]
+        self.assertTrue(payload["stream"])
+        self.assertEqual(payload["options"]["num_predict"], 512)
+        request_trace = next(call for call in trace_mock.call_args_list
+                             if call.args[:2] == ("llm", "chat_request"))
+        response_trace = next(call for call in trace_mock.call_args_list
+                              if call.args[:2] == ("llm", "chat_response"))
+        self.assertEqual(request_trace.args[:2], ("llm", "chat_request"))
+        self.assertEqual(response_trace.args[:2], ("llm", "chat_response"))
+        request_meta = request_trace.kwargs["payload"]
+        response_meta = response_trace.kwargs["payload"]
+        self.assertEqual(request_meta["generation_phase"], "correction")
+        self.assertEqual(request_meta["react_iteration"], 2)
+        self.assertFalse(request_meta["effective_think"])
+        self.assertEqual(request_meta["effective_num_predict"], 512)
+        self.assertTrue(request_meta["tools_exposed"])
+        self.assertNotIn("messages", request_meta)
+        self.assertEqual(response_meta["thinking_chars_received"], 5)
+        self.assertEqual(response_meta["prompt_eval_count"], 42)
+        self.assertEqual(response_meta["generation_token_count"], 8)
+        self.assertEqual(response_meta["done_reason"], "stop")
+        self.assertNotIn("thinking", response_meta)
+        self.assertNotIn("content", response_meta)
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_buffered_chat_interrupted_stream_returns_no_partial_tool_call(self, post_mock):
+        post_mock.return_value = make_response(lines=[
+            b'{"message":{"tool_calls":[{"function":{"name":"beliefs__update","arguments":{}}}]},"done":false}',
+        ])
+        client = OllamaClient(model="test-model", host="http://localhost:11434")
+        with self.assertRaises(InferenceFailure) as raised:
+            client.chat_buffered([{"role": "user", "content": "hello"}])
+        self.assertEqual(raised.exception.category, "malformed_response")
+        self.assertEqual(post_mock.call_count, 1)
+
+    @patch("app.llm.ollama_stream.time.sleep", return_value=None)
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_chat_does_not_retry_read_timeout(self, post_mock, _sleep_mock):
+        post_mock.side_effect = requests.ReadTimeout("timeout")
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            timeout_s=0.1,
+            max_retries=2,
+            retry_backoff_s=0.0,
+        )
+
+        with self.assertRaises(InferenceFailure) as raised:
+            client.chat([{"role": "user", "content": "hello"}])
+        self.assertEqual(raised.exception.category, "read_timeout")
+        self.assertEqual(post_mock.call_count, 1)
+
+    @patch("app.llm.ollama_stream.time.sleep", return_value=None)
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_chat_retries_connect_timeout_then_succeeds(self, post_mock, _sleep_mock):
+        post_mock.side_effect = [
+            requests.ConnectTimeout("connect"),
+            make_response(data={"message": {"content": "ok"}, "done_reason": "stop"}),
+        ]
+        client = OllamaClient(
+            model="test-model", host="http://localhost:11434",
+            max_retries=2, retry_backoff_s=0.0,
+        )
+        self.assertEqual(
+            client.chat([{"role": "user", "content": "hello"}]),
+            {"content": "ok"},
+        )
+        self.assertEqual(post_mock.call_count, 2)
+
+    @patch("app.llm.ollama_stream.time.sleep", return_value=None)
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_chat_does_not_retry_on_http_400(self, post_mock, _sleep_mock):
+        response = requests.Response()
+        response.status_code = 400
+        post_mock.return_value = make_response(
+            http_error=requests.HTTPError(response=response),
+            status_code=400,
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            timeout_s=0.1,
+            max_retries=3,
+            retry_backoff_s=0.0,
+        )
+
+        with self.assertRaises(InferenceFailure) as raised:
+            client.chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(raised.exception.category, "http_error")
+        self.assertEqual(post_mock.call_count, 1)
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_chat_does_not_retry_images_on_http_500(self, post_mock):
+        error_response = requests.Response()
+        error_response.status_code = 500
+        error_response._content = b'{"error":"internal server error"}'
+
+        post_mock.side_effect = [
+            make_response(
+                http_error=requests.HTTPError(response=error_response),
+                status_code=500,
+            ),
+            make_response(
+                data={"message": {"content": "text fallback"}, "done_reason": "stop"},
+            ),
+        ]
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            max_retries=2,
+            retry_backoff_s=0.0,
+        )
+
+        with self.assertRaises(InferenceFailure) as raised:
+            client.chat(
+                [{"role": "user", "content": "what is this?", "images": ["aGVsbG8="]}],
+                think_override=False,
+            )
+        self.assertEqual(raised.exception.category, "server_error")
+        self.assertEqual(post_mock.call_count, 1)
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_chat_uses_native_endpoint_for_images(self, post_mock):
+        post_mock.return_value = make_response(
+            data={"message": {"content": "image summary"}, "done_reason": "stop"},
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+        )
+
+        result = client.chat(
+            [{"role": "user", "content": "what is this?", "images": ["aGVsbG8="]}],
+            think_override=False,
+            options_override={"num_predict": 160},
+        )
+
+        self.assertEqual(result, {"content": "image summary"})
+        self.assertEqual(post_mock.call_args.args[0], "http://localhost:11434/api/chat")
+        payload = post_mock.call_args.kwargs["json"]
+        self.assertEqual(payload["messages"][0]["images"], ["aGVsbG8="])
+        self.assertEqual(payload["messages"][0]["content"], "what is this?")
+        self.assertEqual(payload["think"], False)
+        self.assertEqual(payload["options"]["num_predict"], 160)
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_uses_configured_thinking_level(self, post_mock):
+        post_mock.return_value = make_response(
+            data={"message": {"content": "ok"}, "done_reason": "stop"},
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            thinking_enabled=True,
+            thinking_level="medium",
+        )
+
+        client.chat([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(post_mock.call_args.kwargs["json"]["think"], "medium")
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_surfaces_thinking_when_content_is_empty(self, post_mock):
+        post_mock.return_value = make_response(
+            lines=[
+                _ndjson_line(
+                    '{"message":{"thinking":"Thinking Process:\\n\\n1. Hello"},"done":false}'
+                ),
+                _ndjson_line('{"message":{},"done":true,"done_reason":"stop"}'),
+            ]
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+        )
+
+        chunks = list(client.stream_chat([{"role": "user", "content": "hello"}], think_override=True))
+
+        self.assertEqual(
+            chunks,
+            ["<think>\n", "Thinking Process:\n\n1. Hello", "\n</think>\n\n"],
+        )
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_passes_inline_thinking_content_through(self, post_mock):
+        post_mock.return_value = make_response(
+            lines=[
+                _ndjson_line(
+                    '{"message":{"content":"<think>secret</think>Visible reply"},"done":false}'
+                ),
+                _ndjson_line('{"message":{},"done":true,"done_reason":"stop"}'),
+            ]
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+        )
+
+        chunks = list(client.stream_chat([{"role": "user", "content": "hello"}]))
+
+        self.assertEqual(
+            chunks,
+            ["<think>secret</think>Visible reply"],
+        )
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_passes_split_inline_thinking_content_through(self, post_mock):
+        post_mock.return_value = make_response(
+            lines=[
+                _ndjson_line('{"message":{"content":"<thi"},"done":false}'),
+                _ndjson_line('{"message":{"content":"nk>secret</th"},"done":false}'),
+                _ndjson_line('{"message":{"content":"ink>Visible"},"done":false}'),
+                _ndjson_line('{"message":{},"done":true,"done_reason":"stop"}'),
+            ]
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+        )
+
+        chunks = list(client.stream_chat([{"role": "user", "content": "hello"}]))
+
+        self.assertEqual(
+            chunks,
+            ["<thi", "nk>secret</th", "ink>Visible"],
+        )
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_uses_configured_repeat_penalty(self, post_mock):
+        post_mock.return_value = make_response(
+            lines=[
+                _ndjson_line('{"message":{"content":"ok"},"done":false}'),
+                _ndjson_line('{"message":{},"done":true,"done_reason":"stop"}'),
+            ]
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            options={"repeat_penalty": 1.33},
+        )
+
+        chunks = list(client.stream_chat([{"role": "user", "content": "hello"}]))
+
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(post_mock.call_args.kwargs["json"]["options"]["repeat_penalty"], 1.33)
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_applies_thinking_option_overrides(self, post_mock):
+        post_mock.return_value = make_response(
+            lines=[
+                _ndjson_line('{"message":{"content":"ok"},"done":false}'),
+                _ndjson_line('{"message":{},"done":true,"done_reason":"stop"}'),
+            ]
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            options={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "repeat_penalty": 1.15,
+                "min_p": 0.05,
+            },
+            thinking_options={
+                "temperature": 0.6,
+                "repeat_penalty": 1.0,
+                "min_p": None,
+            },
+        )
+
+        chunks = list(client.stream_chat([{"role": "user", "content": "hello"}], think_override=True))
+
+        self.assertEqual(chunks, ["ok"])
+        payload = post_mock.call_args.kwargs["json"]
+        self.assertEqual(payload["options"]["temperature"], 0.6)
+        self.assertEqual(payload["options"]["repeat_penalty"], 1.0)
+        self.assertEqual(payload["options"]["top_p"], 0.95)
+        self.assertNotIn("min_p", payload["options"])
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_keeps_normal_options_when_thinking_is_disabled(self, post_mock):
+        post_mock.return_value = make_response(
+            lines=[
+                _ndjson_line('{"message":{"content":"ok"},"done":false}'),
+                _ndjson_line('{"message":{},"done":true,"done_reason":"stop"}'),
+            ]
+        )
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+            options={
+                "temperature": 1.0,
+                "repeat_penalty": 1.15,
+                "min_p": 0.05,
+            },
+            thinking_options={
+                "temperature": 0.6,
+                "repeat_penalty": 1.0,
+                "min_p": None,
+            },
+        )
+
+        chunks = list(client.stream_chat([{"role": "user", "content": "hello"}], think_override=False))
+
+        self.assertEqual(chunks, ["ok"])
+        payload = post_mock.call_args.kwargs["json"]
+        self.assertEqual(payload["options"]["temperature"], 1.0)
+        self.assertEqual(payload["options"]["repeat_penalty"], 1.15)
+        self.assertEqual(payload["options"]["min_p"], 0.05)
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_does_not_retry_images_on_http_500(self, post_mock):
+        error_response = requests.Response()
+        error_response.status_code = 500
+        error_response._content = b'{"error":"internal server error"}'
+
+        post_mock.side_effect = [
+            make_response(
+                lines=[],
+                http_error=requests.HTTPError(response=error_response),
+            ),
+            make_response(
+                lines=[
+                    b'{"message":{"content":"ok"},"done":false}',
+                    b'{"message":{},"done":true,"done_reason":"stop"}',
+                ],
+            ),
+        ]
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+        )
+
+        with self.assertRaises(InferenceFailure) as raised:
+            list(client.stream_chat(
+                [{"role": "user", "content": "hello", "images": ["aGVsbG8="]}]
+            ))
+        self.assertEqual(raised.exception.category, "server_error")
+        self.assertEqual(post_mock.call_count, 1)
+
+    @patch("app.llm.ollama_stream.requests.Session.post")
+    def test_ollama_stream_keeps_images_enabled_after_single_bad_image(self, post_mock):
+        error_response = requests.Response()
+        error_response.status_code = 400
+        error_response._content = b'{"error":"invalid image data"}'
+
+        post_mock.side_effect = [
+            make_response(
+                lines=[],
+                http_error=requests.HTTPError(response=error_response),
+            ),
+            make_response(
+                lines=[
+                    b'{"message":{"content":"first"},"done":false}',
+                    b'{"message":{},"done":true,"done_reason":"stop"}',
+                ],
+            ),
+            make_response(
+                lines=[
+                    b'{"message":{"content":"second"},"done":false}',
+                    b'{"message":{},"done":true,"done_reason":"stop"}',
+                ],
+            ),
+        ]
+
+        client = OllamaClient(
+            model="test-model",
+            host="http://localhost:11434",
+        )
+
+        list(client.stream_chat([{"role": "user", "content": "hello", "images": ["aGVsbG8="]}]))
+        list(client.stream_chat([{"role": "user", "content": "again", "images": ["d29ybGQ="]}]))
+
+        self.assertEqual(post_mock.call_count, 3)
+        last_messages = post_mock.call_args.kwargs["json"]["messages"]
+        self.assertEqual(post_mock.call_args.args[0], "http://localhost:11434/api/chat")
+        self.assertEqual(last_messages[0]["content"], "again")
+        self.assertEqual(last_messages[0]["images"], ["d29ybGQ="])
+
+    @patch("app.tools.web_search.time.sleep", return_value=None)
+    @patch("app.tools.web_search.requests.get")
+    def test_web_search_retries_on_connection_error_then_succeeds(
+        self, get_mock, _sleep_mock
+    ):
+        get_mock.side_effect = [
+            requests.ConnectionError("conn"),
+            make_response(
+                data={
+                    "results": [
+                        {
+                            "title": "T",
+                            "url": "https://example.com",
+                            "content": "C",
+                        }
+                    ]
+                }
+            ),
+        ]
+
+        client = SearXNGClient(
+            base_url="http://localhost:8080",
+            timeout=0.1,
+            max_retries=2,
+            retry_backoff_s=0.0,
+        )
+        results = client.search("query", limit=5)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].title, "T")
+        self.assertEqual(get_mock.call_count, 2)
+
+    @patch("app.tools.web_search.time.sleep", return_value=None)
+    @patch("app.tools.web_search.requests.get")
+    def test_web_search_does_not_retry_on_http_400(self, get_mock, _sleep_mock):
+        response = requests.Response()
+        response.status_code = 400
+        get_mock.side_effect = requests.HTTPError(response=response)
+
+        client = SearXNGClient(
+            base_url="http://localhost:8080",
+            timeout=0.1,
+            max_retries=3,
+            retry_backoff_s=0.0,
+        )
+
+        with self.assertRaises(requests.HTTPError):
+            client.search("query", limit=5)
+
+        self.assertEqual(get_mock.call_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

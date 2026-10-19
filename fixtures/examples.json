@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "notice": "All conversations, preferences, and memories below are fictional sample data.",
+  "sessions": [
+    {
+      "id": "sample-workshop",
+      "title": "Plan a community workshop",
+      "suggestion": "Turn our workshop idea into a practical 90-minute agenda.",
+      "messages": [
+        {
+          "role": "user",
+          "content": "We are planning a fictional community repair workshop for 12 beginners. We have 90 minutes and a budget of 120 euros for consumables. We should avoid mains electricity and power tools."
+        },
+        {
+          "role": "assistant",
+          "content": "We can focus on simple textile repairs and a guided repair assessment. Let’s divide the session between a short introduction, a hands-on activity, and time to share results. What should participants leave with?"
+        },
+        {
+          "role": "user",
+          "content": "Each person should leave with a repaired item and a short checklist they can use at home."
+        }
+      ]
+    },
+    {
+      "id": "sample-observatory",
+      "title": "Continue a remembered project",
+      "suggestion": "What did we decide about the observatory project?",
+      "messages": [
+        {
+          "role": "user",
+          "content": "For our fictional neighborhood observatory project, we decided to borrow equipment before buying anything. The first event should focus on the Moon and include an indoor cloudy-weather activity."
+        },
+        {
+          "role": "assistant",
+          "content": "That gives us a small first event: borrowed equipment, lunar observing when skies allow, and an indoor Moon-mapping activity as a fallback."
+        }
+      ]
+    },
+    {
+      "id": "sample-preferences",
+      "title": "Inspect a corrected belief",
+      "suggestion": "What drink should we offer Alex at the workshop?",
+      "messages": [
+        {
+          "role": "user",
+          "content": "My preferred beverage is coffee."
+        },
+        {
+          "role": "assistant",
+          "content": "This sample starts with a reported preference for coffee."
+        },
+        {
+          "role": "user",
+          "content": "My preferred beverage is now peppermint tea, not coffee."
+        },
+        {
+          "role": "assistant",
+          "content": "The sample preference is now peppermint tea. Knowledge shows the current belief at revision 2; this conversation preserves the earlier report and correction."
+        }
+      ],
+      "beliefs": [
+        {
+          "message_index": 0,
+          "predicate": "preferred_beverage",
+          "value": "coffee",
+          "evidence": "My preferred beverage is coffee."
+        },
+        {
+          "message_index": 2,
+          "predicate": "preferred_beverage",
+          "value": "peppermint tea",
+          "evidence": "My preferred beverage is now peppermint tea, not coffee."
+        }
+      ]
+    }
+  ],
+  "memories": [
+    {
+      "content": "Fictional sample decision reported by Alex in sample-observatory: borrow equipment for the neighborhood observatory before purchasing; begin with lunar observing and prepare an indoor Moon-mapping fallback.",
+      "category": "sample-project",
+      "importance": 3
+    }
+  ]
+}

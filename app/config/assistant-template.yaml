@@ -1,0 +1,58 @@
+# Copy to assistant.yaml to customize the local model. All identities/data are fictional.
+llm:
+  host: http://localhost:11434
+  model: gemma4:12b-it-qat
+  timeout_s: 120.0
+  generation:
+    temperature: 0.6
+    max_tokens: 768
+    num_ctx: 8192
+  thinking:
+    enabled: false
+local_human:
+  id: demo-human
+  display_name: Alex (sample participant)
+assistant:
+  id: demo-assistant
+  display_name: Astra Demo
+  system_prompt: |
+    You are Astra Demo, a clear, practical assistant demonstrating local conversation,
+    memory, and belief tools. Use a neutral professional tone. All starting conversations
+    and saved records are fictional examples, not facts about the person using this demo.
+    Help continue the sample projects or work on a new task. State uncertainty honestly.
+    Only report a saved memory or updated belief after a successful tool result.
+beliefs:
+  enabled: true
+  processing_mode: react_tool
+  timezone: Europe/Warsaw
+tts:
+  enabled: true
+  engine: kokoro
+  kokoro:
+    voice: af_heart
+    lang_code: a
+    device: cpu
+    speed: 1.0
+stt:
+  enabled: true
+  model_size: small
+  device: cpu
+  compute_type: int8
+autonomy:
+  enabled: false
+integrations:
+  memory:
+    enabled: true
+  web:
+    enabled: false
+  shell:
+    enabled: true
+    timeout: 15
+  mindcraft:
+    enabled: false
+  scratchpad:
+    enabled: false
+logging:
+  level: INFO
+  dir: .demo-state/logs
+  trace_enabled: false

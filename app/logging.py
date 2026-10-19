@@ -1,0 +1,474 @@
+import logging
+import logging.config
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+_LOGGING_CONFIGURED = False
+_CONFIGURED_HANDLERS: tuple[logging.Handler, ...] = ()
+_PREVIOUS_ROOT_LEVEL: int | None = None
+_PREVIOUS_TRACE_STATE: tuple[int, bool, bool] | None = None
+_TRACE_LOGGER_NAME = "trace"
+_SENSITIVE_BINARY_KEYS = {"base64_data", "data", "images", "audios"}
+_DEFAULT_MAX_STRING_CHARS = 4000
+_DEFAULT_MAX_LOG_CHARS = 12000
+_TRACE_MAX_STRING_CHARS: int | None = None
+_TRACE_MAX_EVENT_CHARS: int | None = None
+_TRACE_INCLUDE_THINKING = False
+_WARNED_UNREGISTERED_TRACE_EVENTS: set[str] = set()
+
+# Trace naming convention table.
+# Canonical grep token format in logs/trace.log:
+#   "event_key": "<component>.<event>"
+TRACE_EVENT_CONVENTIONS: dict[str, tuple[str, ...]] = {
+    "orchestrator": (
+        "turn_input",
+        "memory_retrieval",
+        "assistant_response",
+        "assistant_response_failed",
+        "llm_stream_complete",
+        "late_routing_directive",
+        "late_routing_observation",
+        "late_routing_stream_complete",
+        "late_routing_inference_timing",
+        "late_routing_inference_failure",
+        "belief_update_rejected",
+        "forced_recovery",
+        "proactive_event",
+    ),
+    "context_builder": ("context_built",),
+    "llm": (
+        "request_payload",
+        "thinking_output",
+        "chat_request",
+        "chat_response",
+        "chat_retry_without_images",
+        "stream_request",
+        "stream_response",
+        "stream_retry_without_images",
+        "request_retry",
+        "request_failure",
+    ),
+    "web_search": (
+        "probe_start",
+        "probe_result",
+        "search_request",
+        "search_results",
+        "tool_run",
+        "tool_summary",
+    ),
+    "tool_executor": (
+        "tool_call",
+        "tool_result",
+    ),
+    "memory_retriever": ("retrieval_result",),
+    "scratchpad_context": ("scratchpad_retrieval",),
+    "memory_action": (
+        "memory_action_skipped",
+        "memory_action_applied",
+    ),
+    "turn_finalizer": (
+        "summarization_check",
+        "summary_input",
+        "summary_saved",
+    ),
+    "history_summarizer": ("summary_generated",),
+    "search_summarizer": ("summary_generated",),
+    "image_summarizer": ("summary_generated",),
+    "memory_store": (
+        "memory_saved",
+        "semantic_query_result",
+    ),
+    "chat_history": (
+        "history_add",
+        "attachment_stored",
+        "attachment_summary",
+        "episodic_search",
+        "recent_history",
+    ),
+    "summary_store": (
+        "summary_get",
+        "summary_set",
+    ),
+    "memory_reflector": (
+        "reflection_input",
+        "llm_output",
+        "reflection_complete",
+        "reflection_parse_error",
+    ),
+    "belief_observer": (
+        "extraction_complete",
+        "extraction_failed",
+    ),
+}
+
+
+def _coerce_level(level: int | str | None, default: int) -> int:
+    if level is None:
+        return default
+    if isinstance(level, int):
+        return level
+    if isinstance(level, str):
+        normalized = logging.getLevelName(level.upper())
+        if isinstance(normalized, int):
+            return normalized
+    return default
+
+
+def _sanitize_for_debug(
+    value: Any,
+    *,
+    parent_key: str | None = None,
+    max_string_chars: int | None = _DEFAULT_MAX_STRING_CHARS,
+    max_depth: int = 8,
+    _depth: int = 0,
+) -> Any:
+    if _depth >= max_depth:
+        return "<log-only omission: max-depth-reached>"
+
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_for_debug(
+                item,
+                parent_key=str(key),
+                max_string_chars=max_string_chars,
+                max_depth=max_depth,
+                _depth=_depth + 1,
+            )
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [
+            _sanitize_for_debug(
+                item,
+                parent_key=parent_key,
+                max_string_chars=max_string_chars,
+                max_depth=max_depth,
+                _depth=_depth + 1,
+            )
+            for item in value
+        ]
+
+    if isinstance(value, str):
+        if parent_key in _SENSITIVE_BINARY_KEYS:
+            return f"<omitted {parent_key} len={len(value)}>"
+        if max_string_chars is not None and len(value) > max_string_chars:
+            return f"{value[:max_string_chars]}... [log-only truncation: {len(value) - max_string_chars} chars omitted]"
+        return value
+
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+
+    if hasattr(value, "model_dump"):
+        return _sanitize_for_debug(
+            value.model_dump(),
+            parent_key=parent_key,
+            max_string_chars=max_string_chars,
+            max_depth=max_depth,
+            _depth=_depth + 1,
+        )
+
+    if hasattr(value, "__dict__"):
+        return _sanitize_for_debug(
+            vars(value),
+            parent_key=parent_key,
+            max_string_chars=max_string_chars,
+            max_depth=max_depth,
+            _depth=_depth + 1,
+        )
+
+    return repr(value)
+
+
+def serialize_for_debug(
+    value: Any,
+    *,
+    max_chars: int | None = _DEFAULT_MAX_LOG_CHARS,
+    max_string_chars: int | None = _DEFAULT_MAX_STRING_CHARS,
+    max_depth: int = 8,
+) -> str:
+    sanitized = _sanitize_for_debug(value, max_string_chars=max_string_chars, max_depth=max_depth)
+    try:
+        rendered = json.dumps(sanitized, ensure_ascii=True, indent=2, sort_keys=True)
+    except TypeError:
+        rendered = repr(sanitized)
+
+    if max_chars is not None and len(rendered) > max_chars:
+        # Never slice serialized JSON: keep a parseable event with explicit
+        # diagnostic-only truncation metadata and an escaped preview.
+        envelope = {
+            key: sanitized[key]
+            for key in ("component", "event", "event_key", "session_id")
+            if isinstance(sanitized, dict) and key in sanitized
+        }
+        envelope["log_truncation"] = {
+            "log_only": True,
+            "reason": "event_limit",
+            "original_chars": len(rendered),
+            "limit_chars": max_chars,
+        }
+        envelope["preview"] = ""
+        low, high = 0, min(len(rendered), max_chars)
+        while low < high:
+            middle = (low + high + 1) // 2
+            envelope["preview"] = rendered[:middle]
+            if len(json.dumps(envelope, ensure_ascii=True, indent=2)) <= max_chars:
+                low = middle
+            else:
+                high = middle - 1
+        envelope["preview"] = rendered[:low]
+        return json.dumps(envelope, ensure_ascii=True, indent=2)
+    return rendered
+
+
+def setup_logging(
+    level=logging.INFO,
+    log_dir: str = "logs",
+    *,
+    console_level: int | str | None = None,
+    file_level: int | str | None = logging.INFO,
+    file_name: str = "assistant.log",
+    max_bytes: int = 10_000_000,
+    backup_count: int = 5,
+    trace_enabled: bool = True,
+    trace_level: int | str | None = logging.DEBUG,
+    trace_file_name: str = "trace.log",
+    trace_max_bytes: int | None = None,
+    trace_backup_count: int | None = None,
+    trace_max_string_chars: int | None = None,
+    trace_max_event_chars: int | None = None,
+    trace_include_thinking: bool = False,
+) -> None:
+    global _CONFIGURED_HANDLERS
+    global _LOGGING_CONFIGURED
+    global _PREVIOUS_ROOT_LEVEL
+    global _PREVIOUS_TRACE_STATE
+    global _TRACE_MAX_STRING_CHARS, _TRACE_MAX_EVENT_CHARS, _TRACE_INCLUDE_THINKING
+
+    if _LOGGING_CONFIGURED:
+        logging.getLogger(__name__).debug("Logging already configured, skipping")
+        return
+
+    resolved_console_level = _coerce_level(console_level, _coerce_level(level, logging.INFO))
+    resolved_file_level = _coerce_level(file_level, logging.INFO)
+    resolved_trace_level = _coerce_level(trace_level, logging.DEBUG)
+    root_level = min(resolved_console_level, resolved_file_level)
+
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+
+    log_file = log_path / file_name
+    trace_file = log_path / trace_file_name
+
+    handlers = {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": sys.stdout,
+            "formatter": "default",
+            "level": resolved_console_level,
+        },
+        "file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(log_file),
+            "maxBytes": max_bytes,
+            "backupCount": backup_count,
+            "encoding": "utf-8",
+            "formatter": "default",
+            "level": resolved_file_level,
+        },
+    }
+
+    loggers = {}
+    if trace_enabled:
+        handlers["trace_file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(trace_file),
+            "maxBytes": trace_max_bytes or max_bytes,
+            "backupCount": trace_backup_count or backup_count,
+            "encoding": "utf-8",
+            "formatter": "default",
+            "level": resolved_trace_level,
+        }
+        loggers[_TRACE_LOGGER_NAME] = {
+            "level": resolved_trace_level,
+            "handlers": ["trace_file"],
+            "propagate": False,
+        }
+    else:
+        loggers[_TRACE_LOGGER_NAME] = {
+            "level": logging.CRITICAL,
+            "handlers": [],
+            "propagate": False,
+        }
+
+    logging_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+                "datefmt": "%H:%M:%S",
+            },
+        },
+        "handlers": handlers,
+        "loggers": loggers,
+        "root": {
+            "level": root_level,
+            "handlers": ["console", "file"],
+        },
+    }
+
+    root = logging.getLogger()
+    trace_logger = logging.getLogger(_TRACE_LOGGER_NAME)
+    previous_root_level = root.level
+    previous_trace_state = (
+        trace_logger.level,
+        trace_logger.propagate,
+        trace_logger.disabled,
+    )
+
+    logging.config.dictConfig(logging_config)
+
+    trace_logger = logging.getLogger(_TRACE_LOGGER_NAME)
+    configured_handlers = tuple(
+        dict.fromkeys((*root.handlers, *trace_logger.handlers))
+    )
+    root.info("Logging initialized")
+    root.info(
+        "Log levels: console=%s file=%s",
+        logging.getLevelName(resolved_console_level),
+        logging.getLevelName(resolved_file_level),
+    )
+    root.info("Log file: %s", log_file.resolve())
+    if trace_enabled:
+        root.info(
+            "Trace log: %s (level=%s)",
+            trace_file.resolve(),
+            logging.getLevelName(resolved_trace_level),
+        )
+
+    _CONFIGURED_HANDLERS = configured_handlers
+    _PREVIOUS_ROOT_LEVEL = previous_root_level
+    _PREVIOUS_TRACE_STATE = previous_trace_state
+    _LOGGING_CONFIGURED = True
+    _TRACE_MAX_STRING_CHARS = trace_max_string_chars
+    _TRACE_MAX_EVENT_CHARS = trace_max_event_chars
+    _TRACE_INCLUDE_THINKING = trace_include_thinking
+
+
+def reset_logging() -> None:
+    """Release ASTRA-owned handlers and allow controlled reconfiguration."""
+    global _CONFIGURED_HANDLERS
+    global _LOGGING_CONFIGURED
+    global _PREVIOUS_ROOT_LEVEL
+    global _PREVIOUS_TRACE_STATE
+    global _TRACE_MAX_STRING_CHARS, _TRACE_MAX_EVENT_CHARS, _TRACE_INCLUDE_THINKING
+
+    root = logging.getLogger()
+    trace_logger = logging.getLogger(_TRACE_LOGGER_NAME)
+    owned_handler_ids = {id(handler) for handler in _CONFIGURED_HANDLERS}
+
+    for logger in (root, trace_logger):
+        for handler in tuple(logger.handlers):
+            if id(handler) in owned_handler_ids:
+                logger.removeHandler(handler)
+
+    for handler in _CONFIGURED_HANDLERS:
+        handler.close()
+
+    if _PREVIOUS_ROOT_LEVEL is not None:
+        root.setLevel(_PREVIOUS_ROOT_LEVEL)
+    if _PREVIOUS_TRACE_STATE is not None:
+        trace_level, trace_propagate, trace_disabled = _PREVIOUS_TRACE_STATE
+        trace_logger.setLevel(trace_level)
+        trace_logger.propagate = trace_propagate
+        trace_logger.disabled = trace_disabled
+
+    _CONFIGURED_HANDLERS = ()
+    _PREVIOUS_ROOT_LEVEL = None
+    _PREVIOUS_TRACE_STATE = None
+    _LOGGING_CONFIGURED = False
+    _TRACE_MAX_STRING_CHARS = None
+    _TRACE_MAX_EVENT_CHARS = None
+    _TRACE_INCLUDE_THINKING = False
+    _WARNED_UNREGISTERED_TRACE_EVENTS.clear()
+
+
+def setup_logging_from_config(config: dict | None = None) -> None:
+    config = config or {}
+    setup_logging(
+        level=config.get("level", logging.INFO),
+        console_level=config.get("console_level"),
+        file_level=config.get("file_level", logging.INFO),
+        log_dir=config.get("dir", "logs"),
+        file_name=config.get("file_name", "assistant.log"),
+        max_bytes=config.get("max_bytes", 10_000_000),
+        backup_count=config.get("backup_count", 5),
+        trace_enabled=config.get("trace_enabled", True),
+        trace_level=config.get("trace_level", logging.DEBUG),
+        trace_file_name=config.get("trace_file_name", "trace.log"),
+        trace_max_bytes=config.get("trace_max_bytes"),
+        trace_backup_count=config.get("trace_backup_count"),
+        trace_max_string_chars=config.get("trace_max_string_chars"),
+        trace_max_event_chars=config.get("trace_max_event_chars"),
+        trace_include_thinking=config.get("trace_include_thinking", False),
+    )
+
+
+def trace_event(
+    component: str,
+    event: str,
+    *,
+    session_id: str | None = None,
+    payload: Any = None,
+    **fields: Any,
+) -> None:
+    trace_logger = logging.getLogger(_TRACE_LOGGER_NAME)
+    if not trace_logger.isEnabledFor(logging.DEBUG):
+        return
+
+    known_component = component in TRACE_EVENT_CONVENTIONS
+    known_event = event in TRACE_EVENT_CONVENTIONS.get(component, ())
+
+    record: dict[str, Any] = {
+        "component": component,
+        "event": event,
+        "event_key": f"{component}.{event}",
+    }
+    if not known_component or not known_event:
+        record["convention"] = "unregistered"
+        event_key = record["event_key"]
+        if event_key not in _WARNED_UNREGISTERED_TRACE_EVENTS:
+            _WARNED_UNREGISTERED_TRACE_EVENTS.add(event_key)
+            logging.getLogger(__name__).warning(
+                "Unregistered trace event convention: %s",
+                event_key,
+            )
+    if session_id is not None:
+        record["session_id"] = session_id
+    if fields:
+        record["fields"] = fields
+    if payload is not None:
+        record["payload"] = payload
+
+    trace_logger.debug(serialize_for_debug(
+        record,
+        max_chars=_TRACE_MAX_EVENT_CHARS,
+        max_string_chars=_TRACE_MAX_STRING_CHARS,
+        max_depth=32,
+    ))
+
+
+def trace_thinking_output(thinking: str | None, *, session_id: str | None = None,
+                          **metadata: Any) -> None:
+    """Log model-returned native thinking once, only when explicitly enabled."""
+    if not _TRACE_INCLUDE_THINKING or not thinking:
+        return
+    trace_event("llm", "thinking_output", session_id=session_id, payload={
+        **metadata,
+        "thinking": thinking,
+        "thinking_chars": len(thinking),
+    })

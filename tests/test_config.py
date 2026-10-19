@@ -1,0 +1,606 @@
+import tempfile
+import unittest
+
+import yaml
+from pathlib import Path
+
+from app.config import Config
+
+
+class ConfigTests(unittest.TestCase):
+    def _load(self, payload):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config_file:
+            yaml.safe_dump(payload, config_file)
+            config_file.flush()
+            return Config(config_file.name)
+
+    def test_scratchpad_defaults_disable_and_limits(self):
+        defaults = self._load({}).integrations["scratchpad"]
+        self.assertEqual(defaults["recall_limit"], 3)
+        self.assertTrue(defaults["enabled"])
+        self.assertFalse(self._load({"integrations": {"scratchpad": {"enabled": False}}}).integrations["scratchpad"]["enabled"])
+        for field, value in (("recall_limit", 0), ("recall_limit", 21),
+                             ("query_max_chars", 2001), ("context_max_chars", 299),
+                             ("max_distance", 2.1), ("recall_limit", True)):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self._load({"integrations": {"scratchpad": {field: value}}})
+
+    def test_empty_document_and_empty_sections_preserve_defaults(self):
+        defaults = self._load({})
+        self.assertEqual(self._load(None).raw, defaults.raw)
+        self.assertEqual(
+            self._load({section: {} for section in defaults.raw}).raw,
+            defaults.raw,
+        )
+
+    def test_raw_sections_share_normalized_public_dictionaries(self):
+        config = self._load({
+            "llm": {
+                "host": " https://ollama.example.test/ ",
+                "generation": {"temperature": None, "max_tokens": 128},
+            },
+            "tts": {"engine": "pocket"},
+        })
+
+        self.assertEqual(config.raw["llm"]["host"], "https://ollama.example.test")
+        self.assertEqual(config.raw["llm"]["generation"], {"max_tokens": 128})
+        self.assertEqual(config.raw["tts"]["engine"], "pocket_tts")
+        self.assertIn("vision_watchdog", config.raw)
+        for section, values in config.raw.items():
+            with self.subTest(section=section):
+                self.assertIs(getattr(config, section), values)
+
+    def test_summary_generation_settings(self):
+        defaults = self._load({}).orchestrator
+        self.assertEqual(defaults["summary_timeout_s"], 300.0)
+        self.assertEqual(defaults["summary_num_predict"], 384)
+        custom = self._load({"orchestrator": {
+            "summary_timeout_s": 240.0, "summary_num_predict": 256,
+        }}).orchestrator
+        self.assertEqual(custom["summary_timeout_s"], 240.0)
+        self.assertEqual(custom["summary_num_predict"], 256)
+        for field, value in (("summary_timeout_s", 0), ("summary_timeout_s", 3601),
+                             ("summary_num_predict", 0), ("summary_num_predict", True)):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self._load({"orchestrator": {field: value}})
+
+    def test_document_root_and_sections_must_be_mappings(self):
+        for payload, expected in (
+            (["not", "a", "mapping"], "document root must be a mapping"),
+            ({"context": []}, "context must be a mapping"),
+        ):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_unknown_top_level_and_runtime_fields_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unsupported top-level.*contex"):
+            self._load({"contex": {"history_limit": 5}})
+        with self.assertRaisesRegex(ValueError, "unsupported top-level.*planner"):
+            self._load({"planner": {"mode": "rule"}})
+        with self.assertRaisesRegex(ValueError, "context.typo.*extra_forbidden"):
+            self._load({"context": {"typo": 5}})
+        with self.assertRaisesRegex(ValueError, "voice_input.typo.*extra_forbidden"):
+            self._load({"voice_input": {"typo": True}})
+
+    def test_runtime_scalar_types_and_bounds_are_strict(self):
+        invalid = (
+            ({"autonomy": {"enabled": "false"}}, "autonomy.enabled"),
+            ({"context": {"history_limit": 0}}, "context.history_limit"),
+            ({"context": {"image_summary_timeout_s": 0}}, "image_summary_timeout_s"),
+            ({"context": {"image_summary_timeout_s": "15"}}, "image_summary_timeout_s"),
+            ({"orchestrator": {"recovery_num_predict": True}}, "recovery_num_predict"),
+            ({"voice_input": {"path": "native"}}, "voice_input.path"),
+            ({"vision_watchdog": {"max_new_tokens": -1}}, "max_new_tokens"),
+            ({"telemetry": {"mode": "verbose"}}, "telemetry.mode"),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_llm_and_identity_unknown_fields_are_rejected(self):
+        invalid = (
+            ({"llm": {"typo": True}}, "llm.typo"),
+            ({"llm": {"generation": {"frequency_penalty": 1.0}}}, "frequency_penalty"),
+            ({"llm": {"thinking": {"mode": "high"}}}, "thinking.mode"),
+            ({"assistant": {"nickname": "Star"}}, "assistant.nickname"),
+            ({"assistant": {"personality": {"tone": "warm"}}}, "personality.tone"),
+            ({"local_human": {"name": "User"}}, "local_human.name"),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_llm_types_ranges_and_aliases_are_strict(self):
+        invalid = (
+            ({"llm": {"backend": "openai"}}, "llm.backend"),
+            ({"llm": {"timeout_s": "30"}}, "llm.timeout_s"),
+            ({"llm": {"max_retries": -1}}, "llm.max_retries"),
+            ({"llm": {"thinking": {"enabled": "yes"}}}, "thinking.enabled"),
+            ({"llm": {"thinking": {"level": "maximum"}}}, "thinking.level"),
+            ({"llm": {"generation": {"temperature": 2.1}}}, "temperature"),
+            ({"llm": {"generation": {"top_p": 1.1}}}, "top_p"),
+            ({"llm": {"generation": {"max_tokens": 0}}}, "max_tokens"),
+            (
+                {"llm": {"generation": {"max_tokens": 128, "num_predict": 128}}},
+                "configure only one",
+            ),
+            (
+                {"llm": {"generation": {"rep_pen": 1.1, "repeat_penalty": 1.1}}},
+                "configure only one",
+            ),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_llm_host_is_a_normalized_http_origin(self):
+        config = self._load({"llm": {"host": " https://ollama.example.test/ "}})
+        self.assertEqual(config.llm["host"], "https://ollama.example.test")
+
+        for host in (
+            "ollama.example.test",
+            "ftp://ollama.example.test",
+            "http://user:secret@ollama.example.test",
+            "http://ollama.example.test/api",
+            "http://ollama.example.test?model=test",
+        ):
+            with self.subTest(host=host), self.assertRaisesRegex(ValueError, "HTTP.*origin"):
+                self._load({"llm": {"host": host}})
+
+    def test_identity_values_are_normalized_and_bounded(self):
+        config = self._load({
+            "local_human": {"id": " user-1 ", "display_name": " User One "},
+            "assistant": {
+                "id": " agent:astra ",
+                "display_name": " Astra ",
+                "system_prompt": " Be helpful. ",
+                "avatar_controls": {
+                    "default_outfit": " default ",
+                    "expressions": [" Happy ", "neutral"],
+                },
+            },
+        })
+
+        self.assertEqual(config.local_human, {"id": "user-1", "display_name": "User One"})
+        self.assertEqual(config.assistant["id"], "agent:astra")
+        self.assertEqual(config.assistant["display_name"], "Astra")
+        self.assertEqual(config.assistant["system_prompt"], "Be helpful.")
+        self.assertEqual(
+            config.assistant["avatar_controls"]["expressions"],
+            ["happy", "neutral"],
+        )
+
+    def test_invalid_identity_and_avatar_values_are_rejected(self):
+        invalid = (
+            ({"local_human": {"id": "../user"}}, "local_human.id"),
+            ({"local_human": {"display_name": 123}}, "local_human.display_name"),
+            ({"assistant": {"system_prompt": "  "}}, "system_prompt"),
+            (
+                {"assistant": {"avatar_controls": {"expressions": []}}},
+                "expressions must not be empty",
+            ),
+            (
+                {"assistant": {"avatar_controls": {"expressions": ["happy", "HAPPY"]}}},
+                "duplicate avatar expression",
+            ),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_kokoro_english_voice_and_settings_are_validated(self):
+        demo = Config('app/config/assistant-template.yaml')
+        self.assertEqual(demo.tts['engine'],'kokoro')
+        self.assertEqual(demo.tts['kokoro']['voice'],'af_heart')
+        self.assertTrue(demo.stt['enabled'])
+        self.assertTrue(demo.integrations['shell']['enabled'])
+        for settings in ({'voice':'../../voice'},{'voice':'pf_example'},{'lang_code':'p'},{'voice':'bf_emma','lang_code':'a'},{'speed':0}):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                self._load({'tts':{'engine':'kokoro','kokoro':settings}})
+
+    def test_tts_engine_aliases_are_normalized(self):
+        for alias, canonical in (
+            ("pocket-tts", "pocket_tts"),
+            ("pocket", "pocket_tts"),
+            ("gpt-sovits", "gpt_sovits"),
+            ("sovits", "gpt_sovits"),
+        ):
+            payload = {"tts": {"engine": alias}}
+            if canonical == "gpt_sovits":
+                payload["tts"]["gpt_sovits"] = {"ref_audio_path": "voice.wav"}
+            with self.subTest(alias=alias):
+                config = self._load(payload)
+                self.assertEqual(config.tts["engine"], canonical)
+
+    def test_removed_tts_layouts_fail_with_migration_guidance(self):
+        invalid = (
+            ({"tts": {"engine": "qwen3"}}, "no Qwen TTS engine is implemented"),
+            ({"tts": {"qwen3": {"model_id": "old"}}}, "no Qwen TTS engine"),
+            ({"tts": {"provider": "piper"}}, "provider.*replaced by tts.engine"),
+            ({"tts": {"backend": "piper"}}, "backend.*replaced by tts.engine"),
+            ({"tts": {"model_path": "voice.onnx"}}, "flat TTS settings.*tts.piper"),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+
+    def test_tts_selected_engine_contracts_are_strict(self):
+        invalid = (
+            ({"tts": {"engine": "gpt_sovits"}}, "requires.*ref_audio_path"),
+            (
+                {
+                    "tts": {
+                        "engine": "gpt_sovits",
+                        "gpt_sovits": {
+                            "ref_audio_path": "voice.wav",
+                            "api_url": "file:///tmp/tts",
+                        },
+                    }
+                },
+                "HTTP.*URL",
+            ),
+            ({"tts": {"piper": {"use_cuda": "false"}}}, "piper.use_cuda"),
+            ({"tts": {"piper": {"model": "voice.onnx"}}}, "piper.model"),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_stt_contract_normalizes_names_and_vad_defaults(self):
+        config = self._load({
+            "stt": {
+                "model_size": " small ",
+                "device": " cpu ",
+                "compute_type": " int8 ",
+                "vad_parameters": {"threshold": 0.6},
+            }
+        })
+
+        self.assertEqual(config.stt["model_size"], "small")
+        self.assertEqual(config.stt["device"], "cpu")
+        self.assertEqual(config.stt["compute_type"], "int8")
+        self.assertEqual(config.stt["vad_parameters"]["threshold"], 0.6)
+        self.assertEqual(config.stt["vad_parameters"]["min_silence_duration_ms"], 300)
+
+    def test_stt_types_ranges_and_nested_fields_are_strict(self):
+        invalid = (
+            ({"stt": {"enabled": "true"}}, "stt.enabled"),
+            ({"stt": {"vad_filter": 1}}, "stt.vad_filter"),
+            ({"stt": {"model_size": " "}}, "stt.model_size"),
+            ({"stt": {"vad_parameters": {"threshold": 1.1}}}, "threshold"),
+            ({"stt": {"vad_parameters": {"min_silence_duration_ms": -1}}}, "min_silence"),
+            ({"stt": {"vad_parameters": {"unknown": 1}}}, "vad_parameters.unknown"),
+            (
+                {
+                    "stt": {
+                        "vad_parameters": {"threshold": 0.4, "neg_threshold": 0.5}
+                    }
+                },
+                "neg_threshold must not exceed threshold",
+            ),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_logging_contract_normalizes_levels_and_preserves_paths(self):
+        config = self._load({
+            "logging": {
+                "level": " warning ",
+                "console_level": "warn",
+                "file_level": "error",
+                "dir": " runtime-logs ",
+                "file_name": "astra.log",
+                "trace_level": "fatal",
+                "trace_file_name": "astra-trace.log",
+            }
+        })
+
+        self.assertEqual(config.logging["level"], "WARNING")
+        self.assertEqual(config.logging["console_level"], "WARNING")
+        self.assertEqual(config.logging["file_level"], "ERROR")
+        self.assertEqual(config.logging["trace_level"], "CRITICAL")
+        self.assertEqual(config.logging["dir"], "runtime-logs")
+        self.assertEqual(config.logging["file_name"], "astra.log")
+
+    def test_logging_fields_types_and_ranges_are_strict(self):
+        invalid = (
+            ({"logging": {"console_level": 20}}, "logging.console_level"),
+            ({"logging": {"level": "verbose"}}, "logging.level"),
+            ({"logging": {"trace_enabled": "false"}}, "logging.trace_enabled"),
+            ({"logging": {"max_bytes": 0}}, "logging.max_bytes"),
+            ({"logging": {"backup_count": -1}}, "logging.backup_count"),
+            ({"logging": {"trace_max_bytes": True}}, "logging.trace_max_bytes"),
+            ({"logging": {"trace_max_string_chars": 0}}, "logging.trace_max_string_chars"),
+            ({"logging": {"trace_max_event_chars": 100}}, "logging.trace_max_event_chars"),
+            ({"logging": {"trace_max_event_chars": True}}, "logging.trace_max_event_chars"),
+            ({"logging": {"trace_include_thinking": "true"}}, "logging.trace_include_thinking"),
+            ({"logging": {"typo": True}}, "logging.typo"),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_trace_text_limits_and_thinking_are_configurable(self):
+        defaults = self._load({}).logging
+        self.assertIsNone(defaults.get("trace_max_string_chars"))
+        self.assertIsNone(defaults.get("trace_max_event_chars"))
+        self.assertFalse(defaults["trace_include_thinking"])
+        settings = self._load({"logging": {
+            "trace_max_string_chars": 20000,
+            "trace_max_event_chars": 100000,
+            "trace_include_thinking": True,
+        }}).logging
+        self.assertEqual(settings["trace_max_string_chars"], 20000)
+        self.assertEqual(settings["trace_max_event_chars"], 100000)
+        self.assertTrue(settings["trace_include_thinking"])
+
+    def test_logging_file_names_cannot_escape_the_log_directory(self):
+        invalid = (
+            ({"logging": {"file_name": "../assistant.log"}}, "plain file name"),
+            ({"logging": {"trace_file_name": "nested/trace.log"}}, "plain file name"),
+            ({"logging": {"file_name": " "}}, "must not be empty"),
+            ({"logging": {"dir": " "}}, "logging.dir must not be empty"),
+            (
+                {
+                    "logging": {
+                        "file_name": "same.log",
+                        "trace_file_name": "same.log",
+                    }
+                },
+                "must be different",
+            ),
+        )
+        for payload, expected in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, expected):
+                self._load(payload)
+
+    def test_belief_timezone_must_be_valid(self):
+        with self.assertRaisesRegex(ValueError, "valid IANA timezone"):
+            self._load({"beliefs": {"timezone": "Mars/Olympus"}})
+
+    def test_local_human_has_stable_defaults(self):
+        config = self._load({})
+        self.assertEqual(config.local_human, {"id": "local-human", "display_name": "You"})
+
+    def test_context_uses_injected_memory_limit(self):
+        config = self._load(
+            {
+                "context": {
+                    "history_limit": 8,
+                    "injected_memory_limit": 7,
+                    "semantic_memory_max_distance": 0.7,
+                    "semantic_memory_fallback_max_distance": 0.85,
+                    "semantic_memory_fallback_limit": 2,
+                    "episodic_memory_max_distance": 0.7,
+                }
+            }
+        )
+
+        self.assertEqual(config.context["history_limit"], 8)
+        self.assertEqual(config.context["injected_memory_limit"], 7)
+        self.assertEqual(config.context["semantic_memory_max_distance"], 0.7)
+        self.assertEqual(config.context["semantic_memory_fallback_max_distance"], 0.85)
+        self.assertEqual(config.context["semantic_memory_fallback_limit"], 2)
+        self.assertEqual(config.context["episodic_memory_max_distance"], 0.7)
+        self.assertEqual(config.context["integration_context_limit"], 4000)
+        self.assertEqual(config.context["image_summary_timeout_s"], 15.0)
+
+    def test_context_rejects_invalid_semantic_memory_fallback(self):
+        context = {
+            "semantic_memory_max_distance": 0.8,
+            "semantic_memory_fallback_max_distance": 0.7,
+        }
+        with self.assertRaisesRegex(ValueError, "fallback_max_distance must be at least"):
+            self._load({"context": context})
+
+    def test_autonomy_defaults_are_bounded_and_disabled(self):
+        config = self._load({})
+
+        self.assertFalse(config.autonomy["enabled"])
+        self.assertEqual(config.autonomy["max_chain_events"], 20)
+        self.assertEqual(config.autonomy["global_llm_concurrency"], 1)
+
+    def test_belief_storage_defaults_enabled_but_production_is_disabled(self):
+        config = self._load({})
+
+        self.assertTrue(config.beliefs["enabled"])
+        self.assertEqual(config.beliefs["processing_mode"], "disabled")
+        self.assertEqual(config.beliefs["max_candidates"], 4)
+        self.assertEqual(config.beliefs["max_generation_tokens"], 384)
+        self.assertEqual(config.beliefs["max_existing_beliefs"], 24)
+
+    def test_all_belief_processing_modes_are_accepted(self):
+        for mode in ("disabled", "observer", "react_tool"):
+            with self.subTest(mode=mode):
+                config = self._load({"beliefs": {"enabled": True, "processing_mode": mode}})
+            self.assertEqual(config.beliefs["processing_mode"], mode)
+
+    def test_invalid_belief_processing_mode_fails(self):
+        with self.assertRaisesRegex(ValueError, 'disabled, observer, react_tool'):
+            self._load({'beliefs': {'processing_mode': 'invalid'}})
+
+    def test_legacy_belief_extraction_key_fails_with_migration_guidance(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'was replaced.*processing_mode'):
+                    self._load({'beliefs': {'extraction_enabled': value}})
+
+    def test_disabled_belief_storage_rejects_active_producer(self):
+        for mode in ("observer", "react_tool"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, 'enabled=false.*disabled'):
+                    self._load({'beliefs': {'enabled': False, 'processing_mode': mode}})
+
+    def test_tracked_template_uses_processing_mode_without_legacy_key(self):
+        template_path = Path("app/config/assistant-template.yaml")
+        template = yaml.safe_load(template_path.read_text())
+        self.assertEqual(template["beliefs"]["processing_mode"], "react_tool")
+        self.assertNotIn("extraction_enabled", template["beliefs"])
+        self.assertNotIn("planner", template)
+        self.assertEqual(template.get("telemetry", {}).get("mode", "none"), "none")
+
+        config = Config(template_path)
+        self.assertEqual(config.llm["backend"], "ollama")
+        self.assertEqual(config.assistant["display_name"], "Astra Demo")
+
+    def test_telemetry_defaults_and_full_mode_are_normalized(self):
+        default = self._load({})
+        self.assertEqual(default.telemetry["mode"], "none")
+        self.assertEqual(default.telemetry["file_name"], "model-telemetry.jsonl")
+
+        configured = self._load({"telemetry": {"mode": "full", "file_name": "metrics.jsonl"}})
+        self.assertEqual(configured.telemetry["mode"], "full")
+        self.assertEqual(configured.telemetry["file_name"], "metrics.jsonl")
+
+        extended = self._load({"telemetry": {"mode": "extended"}})
+        self.assertEqual(extended.telemetry["mode"], "extended")
+
+    def test_integration_config_defaults_memory_and_shell_enabled(self):
+        config = self._load({})
+
+        self.assertTrue(config.integrations["memory"]["enabled"])
+        self.assertTrue(config.integrations["shell"]["enabled"])
+        self.assertFalse(config.integrations["web"]["enabled"])
+        self.assertEqual(config.integrations["web"]["max_results"], 5)
+        self.assertFalse(config.integrations["mindcraft"]["enabled"])
+        self.assertEqual(config.integrations["mindcraft"]["url"], "http://localhost:8081")
+        self.assertEqual(config.integrations["mindcraft"]["reconnect_max_delay_s"], 30.0)
+
+    def test_removed_tools_web_config_fails_with_migration_guidance(self):
+        for payload in (
+            {"tools": {"web": {"enabled": True}}},
+            {
+                "tools": {"web": {"enabled": True}},
+                "integrations": {"web": {"enabled": False}},
+            },
+            {"tools": {}},
+        ):
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                ValueError,
+                "tools.web was removed.*integrations.web",
+            ):
+                self._load(payload)
+
+    def test_web_integration_contract_is_strict_and_normalized(self):
+        config = self._load({
+            "integrations": {
+                "web": {
+                    "enabled": True,
+                    "base_url": " http://localhost:8080/searx/ ",
+                    "timeout": 12.0,
+                    "max_retries": 3,
+                    "retry_backoff_s": 0.5,
+                    "max_results": 7,
+                }
+            }
+        })
+
+        self.assertEqual(config.integrations["web"]["base_url"], "http://localhost:8080/searx")
+        self.assertEqual(config.integrations["web"]["max_results"], 7)
+
+        invalid = (
+            ({"web": {"enabled": "true"}}, "web.enabled"),
+            ({"web": {"base_url": "file:///tmp/search"}}, "web.base_url"),
+            ({"web": {"base_url": "http://user:secret@localhost"}}, "web.base_url"),
+            ({"web": {"timeout": 0}}, "web.timeout"),
+            ({"web": {"max_retries": True}}, "web.max_retries"),
+            ({"web": {"max_results": 0}}, "web.max_results"),
+            ({"web": {"typo": True}}, "web.typo"),
+        )
+        for integrations, expected in invalid:
+            with self.subTest(integrations=integrations), self.assertRaisesRegex(
+                ValueError,
+                expected,
+            ):
+                self._load({"integrations": integrations})
+
+    def test_memory_shell_and_integration_names_are_strict(self):
+        invalid = (
+            ({"memory": {"enabled": 1}}, "memory.enabled"),
+            ({"memory": {"mode": "write"}}, "memory.mode"),
+            ({"shell": {"timeout": "15"}}, "shell.timeout"),
+            ({"shell": {"timeout": 0}}, "shell.timeout"),
+            ({"unknown": {"enabled": True}}, "integrations.unknown"),
+        )
+        for integrations, expected in invalid:
+            with self.subTest(integrations=integrations), self.assertRaisesRegex(
+                ValueError,
+                expected,
+            ):
+                self._load({"integrations": integrations})
+
+    def test_mindcraft_integration_contract_normalizes_optional_names(self):
+        config = self._load({
+            "integrations": {
+                "mindcraft": {
+                    "enabled": True,
+                    "url": " http://localhost:8081/ ",
+                    "agent_name": " Astra ",
+                    "ambient_session_id": " session-1 ",
+                    "autonomous_events": ["critical_health", "died"],
+                    "attachment_dir": " runtime/mindcraft ",
+                }
+            }
+        })
+
+        mindcraft = config.integrations["mindcraft"]
+        self.assertEqual(mindcraft["url"], "http://localhost:8081")
+        self.assertEqual(mindcraft["agent_name"], "Astra")
+        self.assertEqual(mindcraft["ambient_session_id"], "session-1")
+        self.assertEqual(mindcraft["attachment_dir"], "runtime/mindcraft")
+
+    def test_mindcraft_types_ranges_and_events_are_strict(self):
+        invalid = (
+            ({"context_enabled": "true"}, "context_enabled"),
+            ({"connect_timeout": 0}, "connect_timeout"),
+            ({"recent_output_limit": 0}, "recent_output_limit"),
+            ({"ambient_session_id": "../session"}, "Invalid session ID"),
+            ({"autonomous_events": ["unknown"]}, "autonomous_events.0"),
+            (
+                {"autonomous_events": ["died", "died"]},
+                "must not contain duplicates",
+            ),
+            (
+                {"reconnect_delay_s": 10.0, "reconnect_max_delay_s": 5.0},
+                "must be at least reconnect_delay_s",
+            ),
+            ({"attachment_dir": " "}, "attachment_dir must not be empty"),
+            ({"unknown": True}, "mindcraft.unknown"),
+        )
+        for mindcraft, expected in invalid:
+            with self.subTest(mindcraft=mindcraft), self.assertRaisesRegex(
+                ValueError,
+                expected,
+            ):
+                self._load({"integrations": {"mindcraft": mindcraft}})
+
+    def test_voice_input_defaults_to_stt(self):
+        config = self._load({})
+
+        self.assertEqual(config.voice_input["path"], "stt")
+        self.assertEqual(config.voice_input["native_audio"]["payload_field"], "images")
+        self.assertTrue(config.voice_input["native_audio"]["convert_to_wav"])
+
+    def test_voice_input_merges_native_audio_overrides(self):
+        config = self._load(
+            {
+                "voice_input": {
+                    "path": "native_audio",
+                    "native_audio": {"payload_field": "audios", "sample_rate": 24000},
+                }
+            }
+        )
+
+        self.assertEqual(config.voice_input["path"], "native_audio")
+        self.assertEqual(config.voice_input["native_audio"]["payload_field"], "audios")
+        self.assertEqual(config.voice_input["native_audio"]["sample_rate"], 24000)
+        self.assertEqual(
+            config.voice_input["native_audio"]["prompt_text"],
+            "Please answer the user's spoken audio.",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

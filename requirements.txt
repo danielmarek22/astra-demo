@@ -1,0 +1,3 @@
+# Complete demo runtime.
+-r requirements-core.txt
+-r requirements-media.txt
