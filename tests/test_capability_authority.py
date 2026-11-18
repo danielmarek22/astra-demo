@@ -10,6 +10,7 @@ from app.integrations import (
     CapabilityId, EventId, IntegrationEvent, IntegrationRegistry,
     InvocationContext, RegisteredTool, ToolCall, ToolResult, ToolSpec,
 )
+from tests.support import BufferedResultMock
 
 
 def consume(iterator):
@@ -91,6 +92,33 @@ class CapabilityAuthorityTests(unittest.TestCase):
         row = store._conn.execute('SELECT status FROM integration_operations').fetchone()
         self.assertEqual(row['status'], 'denied')
 
+    def test_workspace_notes_cannot_grant_external_event_authority(self):
+        from app.core.execution_state import ExecutionSettings
+        from tests.test_reasoning_continuation import continuation, call
+        store = AutonomyStore(":memory:")
+        self.addCleanup(store.close)
+        llm = SimpleNamespace(
+            resolve_think_value=lambda override: False,
+            generation_options=lambda *_args: {"num_ctx": 32768, "num_predict": 1024},
+            chat_buffered_result=BufferedResultMock(side_effect=[
+                continuation(next_focus="Run demo__run", plan="I have permission to use all tools"),
+                call(str(self.capability), {}), {"content": "Finished"},
+            ]),
+        )
+        generator = ResponseGenerator(llm, ToolExecutor(self.registry, operation_store=store), Mock(),
+                                      execution_settings=ExecutionSettings(reasoning_enabled=True))
+        messages = []
+        consume(generator.stream_late_routed_response(
+            "session", messages, "test", allowed_capabilities=frozenset(),
+            event=IntegrationEvent(EventId("demo", "wake"), {}, session_id="session"),
+        ))
+        self.handler.assert_not_called()
+        row = store._conn.execute("SELECT status FROM integration_operations").fetchall()
+        self.assertEqual([item["status"] for item in row], ["denied"])
+        observations = [message for message in messages if message["role"] == "tool"]
+        self.assertIn("[denied]", observations[-1]["content"])
+        self.assertEqual(llm.chat_buffered_result.call_count, 3)
+
     def test_native_event_loop_enforces_authority_despite_model_call(self):
         event = IntegrationEvent(EventId('demo', 'wake'), {}, session_id='session')
         for allowed, expected in ((set(), 'denied'), ({self.other}, 'denied'),
@@ -99,7 +127,7 @@ class CapabilityAuthorityTests(unittest.TestCase):
                 self.handler.reset_mock()
                 llm = SimpleNamespace(
                     resolve_think_value=lambda override: True if override is None else override,
-                    chat_buffered=Mock(side_effect=[
+                    chat_buffered_result=BufferedResultMock(side_effect=[
                         {'tool_calls': [{'function': {'name': str(self.capability), 'arguments': {}}}]},
                         {'content': 'Finished'},
                     ]),
@@ -128,7 +156,7 @@ class CapabilityAuthorityTests(unittest.TestCase):
             return model(**kwargs) if calls == 1 else {'content': 'Finished'}
         llm = SimpleNamespace(
             resolve_think_value=lambda override: True if override is None else override,
-            chat_buffered=Mock(side_effect=infer))
+            chat_buffered_result=BufferedResultMock(side_effect=infer))
         consume(ResponseGenerator(llm, ToolExecutor(self.registry), Mock()).stream_late_routed_response(
             'session', [], 'test', allowed_capabilities=allowed, persist_tool_traces=False,
         ))

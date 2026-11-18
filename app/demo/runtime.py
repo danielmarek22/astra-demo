@@ -9,9 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import yaml
+
 from app.config import Config
 from app.core.orchestrator_factory import build_orchestrator
 from app.demo.seeds import seed_examples
+from app.integrations.mcp import MCPIntegration
+from app.integrations.mcp_config_store import MCPConfigStore
+from app.integrations.mcp_management import MCPManagement
 from app.paths import STATE_ROOT, owned_state_path
 
 logger = logging.getLogger(__name__)
@@ -24,6 +29,22 @@ class Generation:
     directory: Path
     orchestrator: object
     manifest: dict
+    mcp_management: MCPManagement | None
+
+
+def _prepare_mcp_management(orchestrator, directory: Path) -> MCPManagement | None:
+    registry = getattr(getattr(orchestrator, "tool_executor", None), "registry", None)
+    integration = registry.get_integration("mcp") if registry is not None else None
+    if not isinstance(integration, MCPIntegration):
+        return None
+    # The upstream management API edits only the workspace-local copy. Reset uses
+    # the launch configuration again, without reconnecting to any servers.
+    config_path = directory / "mcp.yaml"
+    mcp_config = integration.runtime.configuration()
+    with config_path.open("x", encoding="utf-8") as handle:
+        config_path.chmod(0o600)
+        yaml.safe_dump({"integrations": {"mcp": mcp_config}}, handle)
+    return MCPManagement(integration, registry, MCPConfigStore(config_path))
 
 
 class DemoRuntime:
@@ -57,12 +78,13 @@ class DemoRuntime:
         try:
             orchestrator = self.builder(self.settings, state_dir=directory)
             manifest = seed_examples(orchestrator, directory)
+            mcp_management = _prepare_mcp_management(orchestrator, directory)
         except BaseException:
             if orchestrator is not None:
                 orchestrator.close()
             self._remove(directory)
             raise
-        replacement = Generation(generation_id, directory, orchestrator, manifest)
+        replacement = Generation(generation_id, directory, orchestrator, manifest, mcp_management)
         old = self.current
         try:
             if old:

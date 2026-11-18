@@ -9,14 +9,29 @@ no selector can switch to the original Personal runtime.
 `app/core/orchestrator_factory.py` composes the existing Ollama client, SQLite stores,
 Chroma collections, conversation orchestration, history summarization, semantic and
 episodic retrieval, belief context, and validated native tools. The default tool set
-contains memory writes, eligible belief updates, and the existing shell integration. Optional SearXNG web search uses
-the retained web implementation when explicitly configured.
+contains memory writes, eligible belief updates, conversation history search and
+read, and the existing shell integration. History candidates are checked against
+canonical SQLite rows and the accepted turn before use.
+
+The [runtime lifecycle](architecture/runtime.md) follows native inference, tool
+calls, and committed replies. [Context construction](architecture/context-building.md)
+covers prompt assembly and budgeting. [Memory](architecture/memory.md) and
+[Beliefs](architecture/beliefs.md) explain what the assistant carries between turns.
+
+[Web access](architecture/web-access.md) covers structured discovery, optional
+isolated page reading, and source links in the committed answer.
 
 Speech uses the original Whisper adapter, original AudioDelivery queue, original
 browser recording/playback modules, and a new Kokoro TTS adapter. Engines load lazily
 and remain owned by the application across resets. Screen sharing uses the original
 frame-capture functions and attachment pipeline, triggered only by explicit Send.
 Camera, avatar, Minecraft, notebook and autonomous events remain absent.
+
+## Optional web reader
+
+The reader adds page snapshots and literal find to web search. See
+[reader setup](architecture/web-access.md#install-and-enable-the-reader) for
+the Linux dependencies and model context settings.
 
 ## State layout
 
@@ -59,6 +74,19 @@ operating-system sandbox.
 
 Multiple server workers are unsupported. Only the single-process launcher is part
 of the demo's lifecycle contract.
+
+## MCP lifecycle
+
+The workspace initializes its MCP configuration from the launch YAML. The MCP
+tab edits the workspace's own configuration through same-origin,
+revision-checked requests. Connection and catalog refresh are explicit actions.
+Reviewed tools are registered through the same execution loop as built-in tools
+and can use the existing per-turn approval transport.
+
+An admitted MCP management operation owns the workspace gate through completion.
+Reset closes the old connection runtime and rebuilds MCP from the launch YAML.
+MCP servers can take actions outside the workspace, which their services retain
+after a demo reset. See [MCP connections](services/mcp.md) for setup and tool review.
 
 ## Media and approval transport
 

@@ -8,6 +8,105 @@ from app.config import Config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_history_archive_trust_is_explicit_strict_and_bounded(self):
+        defaults = self._load({}).integrations['history']
+        self.assertEqual(defaults, {'enabled': True, 'allow_all_sessions': False, 'trusted_session_ids': []})
+        self.assertTrue(self._load({'integrations': {'history': {'allow_all_sessions': True}}}).integrations['history']['allow_all_sessions'])
+        configured = self._load({'integrations': {'history': {'trusted_session_ids': ['shared-project', 'older-direct']}}})
+        self.assertEqual(configured.integrations['history']['trusted_session_ids'], ['shared-project', 'older-direct'])
+        for settings in (
+            {'trusted_session_ids': '*'}, {'trusted_session_ids': True},
+            {'trusted_session_ids': ['*']}, {'trusted_session_ids': ['../outside']},
+            {'trusted_session_ids': ['']}, {'trusted_session_ids': [' name ']},
+            {'trusted_session_ids': [1]}, {'trusted_session_ids': ['x' * 129]},
+            {'trusted_session_ids': ['duplicate', 'duplicate']},
+            {'trusted_session_ids': [f'archive-{index}' for index in range(257)]},
+            {'trust_all': True},
+            {'allow_all_sessions': 'true'}, {'allow_all_sessions': 1}, {'allow_all_sessions': None},
+        ):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                self._load({'integrations': {'history': settings}})
+
+    def test_execution_profiles_and_reasoning_are_optional_and_strict(self):
+        defaults = self._load({})
+        self.assertEqual(defaults.execution, {"default_profile": "standard", "profiles": {"standard": {}, "deep": {}}})
+        self.assertEqual(defaults.reasoning, {"enabled": False})
+        profile = {"max_inference_steps": 12, "generation_deadline_s": 45.0,
+                   "recovery_deadline_s": 20.0, "recovery_num_predict": 96, "recovery_observation_chars": 8192,
+                   "correction_num_predict": 256, "context_window_tokens": 16384, "num_predict": 1024}
+        configured = self._load({"execution": {"default_profile": "deep", "profiles": {"deep": profile}},
+                                 "reasoning": {"enabled": True}})
+        self.assertEqual(configured.execution["profiles"]["deep"], profile)
+        self.assertTrue(configured.reasoning["enabled"])
+        for payload in (
+            {"execution": {"default_profile": "unknown"}},
+            {"execution": {"profiles": {"typo": {}}}},
+            {"execution": {"profiles": {"deep": {"max_inference_steps": True}}}},
+            {"execution": {"profiles": {"deep": {"recovery_deadline_s": float("inf")}}}},
+            {"execution": {"profiles": {"deep": {"context_window_tokens": 16384, "num_predict": 16384}}}},
+            {"execution": {"profiles": {"deep": {"extra_budget": 1}}}},
+            {"reasoning": {"enabled": "false"}},
+            *({"execution": {"profiles": {"deep": limits}}} for limits in (
+                {"max_continuations": -1}, {"max_continuations": True},
+                {"max_continuation_attempts": 0}, {"max_tool_dispatches": 0},
+                {"workspace": {"max_bytes": 512}}, {"workspace": {"max_items": False}},
+                {"workspace": {"goal_chars": 0}}, {"workspace": {"made_up": 1}},
+            )),
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self._load(payload)
+
+    def test_search_provider_and_key_reference_are_strict_and_default_to_searxng(self):
+        self.assertEqual(self._load({}).integrations["web"]["provider"], "searxng")
+        configured = self._load({"integrations": {"web": {"provider": "langsearch", "langsearch_api_key_env": "CUSTOM_SEARCH_KEY"}}})
+        self.assertEqual(configured.integrations["web"]["langsearch_api_key_env"], "CUSTOM_SEARCH_KEY")
+        for settings in ({"provider": "unknown"}, {"langsearch_api_key_env": ""},
+                         {"langsearch_api_key_env": "key=value"}, {"langsearch_api_key_env": " key "},
+                         {"langsearch_api_key": "do-not-store-keys-in-yaml"}):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                self._load({"integrations": {"web": settings}})
+
+    def test_page_reader_activation_requires_search_budget_and_explicit_model_context(self):
+        base = {"integrations": {"web": {"enabled": True, "reader": {"enabled": True}}}}
+        with self.assertRaisesRegex(ValueError, "prompt_budget.enabled"):
+            self._load(base)
+        base["context"] = {"prompt_budget": {"enabled": True}}
+        with self.assertRaisesRegex(ValueError, "explicit llm.generation.num_ctx"):
+            self._load(base)
+        base["llm"] = {"generation": {"num_ctx": 16384}}
+        activated = self._load(base)
+        self.assertTrue(activated.integrations["web"]["reader"]["enabled"])
+        for field, value in (("max_cpu_percent", 0), ("max_cpu_percent", 401), ("max_tasks", 0), ("max_tasks", True)):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self._load({"integrations": {"web": {"reader": {field: value}}}})
+
+    def test_prompt_budget_is_opt_in_and_validates_finite_reserves(self):
+        defaults = self._load({}).context["prompt_budget"]
+        self.assertFalse(defaults["enabled"])
+        self.assertEqual(defaults["context_window_tokens"], 32768)
+        self.assertTrue(self._load({"context": {"prompt_budget": {"enabled": True}}}).context["prompt_budget"]["enabled"])
+        for settings in ({"enabled": "true"}, {"context_window_tokens": True},
+                         {"context_window_tokens": 1024}, {"completion_reserve_tokens": 0},
+                         {"safety_margin_tokens": 0}, {"media_reserve_tokens": 0}, {"unknown": 1}):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                self._load({"context": {"prompt_budget": settings}})
+
+    def test_web_reader_and_cache_defaults_and_strict_limits(self):
+        defaults = self._load({}).integrations["web"]
+        self.assertFalse(defaults["reader"]["enabled"])
+        self.assertEqual(defaults["cache"]["ttl_s"], 600.0)
+        self.assertEqual(defaults["reader"]["max_requests"], 32)
+        for section, settings in (
+            ("cache", {"ttl_s": 0}), ("cache", {"max_session_bytes": 262144}),
+            ("cache", {"max_total_entries": 50}), ("cache", {"unknown": 1}),
+            ("reader", {"python_executable": "venv/bin/python"}),
+            ("reader", {"browsers_path": "relative/cache"}),
+            ("reader", {"max_response_bytes": 8000000}),
+            ("reader", {"max_requests": True}), ("reader", {"max_memory_mb": 1}),
+        ):
+            with self.subTest(section=section, settings=settings), self.assertRaises(ValueError):
+                self._load({"integrations": {"web": {section: settings}}})
+
     def _load(self, payload):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config_file:
             yaml.safe_dump(payload, config_file)
@@ -89,6 +188,10 @@ class ConfigTests(unittest.TestCase):
             ({"context": {"image_summary_timeout_s": 0}}, "image_summary_timeout_s"),
             ({"context": {"image_summary_timeout_s": "15"}}, "image_summary_timeout_s"),
             ({"orchestrator": {"recovery_num_predict": True}}, "recovery_num_predict"),
+            ({"orchestrator": {"recovery_observation_chars": 0}}, "recovery_observation_chars"),
+            ({"context": {"prompt_budget": {"text_bytes_per_token": True}}}, "text_bytes_per_token"),
+            ({"context": {"prompt_budget": {"text_bytes_per_token": float("inf")}}}, "text_bytes_per_token"),
+            ({"context": {"prompt_budget": {"text_bytes_per_token": 4.1}}}, "text_bytes_per_token"),
             ({"voice_input": {"path": "native"}}, "voice_input.path"),
             ({"vision_watchdog": {"max_new_tokens": -1}}, "max_new_tokens"),
             ({"telemetry": {"mode": "verbose"}}, "telemetry.mode"),
@@ -507,6 +610,15 @@ class ConfigTests(unittest.TestCase):
             ({"web": {"timeout": 0}}, "web.timeout"),
             ({"web": {"max_retries": True}}, "web.max_retries"),
             ({"web": {"max_results": 0}}, "web.max_results"),
+            ({"web": {"total_timeout_s": 0}}, "web.total_timeout_s"),
+            ({"web": {"max_retry_after_s": -1}}, "web.max_retry_after_s"),
+            ({"web": {"max_response_bytes": 100}}, "web.max_response_bytes"),
+            ({"web": {"query_max_chars": True}}, "web.query_max_chars"),
+            ({"web": {"title_max_chars": 0}}, "web.title_max_chars"),
+            ({"web": {"url_max_chars": 5000}}, "web.url_max_chars"),
+            ({"web": {"snippet_max_chars": 0}}, "web.snippet_max_chars"),
+            ({"web": {"max_output_chars": 100}}, "web.max_output_chars"),
+            ({"web": {"query_max_chars": 2000, "max_output_chars": 1024}}, "web.max_output_chars"),
             ({"web": {"typo": True}}, "web.typo"),
         )
         for integrations, expected in invalid:

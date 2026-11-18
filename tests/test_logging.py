@@ -56,6 +56,28 @@ class TraceEventTests(unittest.TestCase):
         module_logger.warning.assert_not_called()
         self.assertEqual(trace_logger.debug.call_count, 4)
 
+    def test_prompt_budget_events_are_registered_without_suppressing_trace_output(self):
+        trace_logger = Mock()
+        trace_logger.isEnabledFor.return_value = True
+        module_logger = Mock()
+
+        def get_logger(name=None):
+            return trace_logger if name == logging_module._TRACE_LOGGER_NAME else module_logger
+
+        with patch("app.logging.logging.getLogger", side_effect=get_logger):
+            for event in ("prompt_budget", "prompt_budget_failure"):
+                logging_module.trace_event("orchestrator", event, session_id="budget-session",
+                                           payload={"phase": "continuation"})
+
+        module_logger.warning.assert_not_called()
+        records = [json.loads(call.args[0]) for call in trace_logger.debug.call_args_list]
+        self.assertEqual([record["event_key"] for record in records],
+                         ["orchestrator.prompt_budget", "orchestrator.prompt_budget_failure"])
+        for record in records:
+            self.assertNotIn("convention", record)
+            self.assertEqual(record["session_id"], "budget-session")
+            self.assertEqual(record["payload"], {"phase": "continuation"})
+
     def test_trace_preserves_long_prompt_and_omits_media_without_mutating_payload(self):
         payload = {"messages": [{"role": "system", "content": "prompt " * 3000},
                                 {"role": "user", "content": "Inspect", "images": ["fixture-bytes"]}]}
@@ -83,6 +105,24 @@ class TraceEventTests(unittest.TestCase):
         string_capped = json.loads(logging_module.serialize_for_debug(value, max_chars=None, max_string_chars=20))
         self.assertIn("log-only truncation", string_capped["payload"]["content"])
 
+    def test_replayed_native_thinking_respects_optional_logging_without_mutating_request(self):
+        payload = {"request": {"messages": [
+            {"role": "assistant", "content": "Preamble", "thinking": "Private plan",
+             "tool_calls": [{"function": {"name": "demo__run", "arguments": {"thinking": "argument"}}}]},
+            {"role": "tool", "tool_name": "demo__run", "content": "Evidence"},
+        ]}}
+        original = copy.deepcopy(payload)
+        trace_logger = logging.getLogger("trace")
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch.object(trace_logger, "isEnabledFor", return_value=True), \
+                    patch.object(trace_logger, "debug") as debug, \
+                    patch.object(logging_module, "_TRACE_INCLUDE_THINKING", enabled):
+                logging_module.trace_event("llm", "request_payload", payload=payload)
+                logged = json.loads(debug.call_args.args[0])["payload"]["request"]["messages"]
+                self.assertEqual(logged[0]["thinking"], "Private plan" if enabled else "<omitted thinking len=12>")
+                self.assertEqual(logged[0]["tool_calls"], original["request"]["messages"][0]["tool_calls"])
+                self.assertEqual(logged[1], original["request"]["messages"][1])
+                self.assertEqual(payload, original)
     def test_thinking_is_optional_and_logged_as_its_own_event(self):
         logger = logging.getLogger("trace")
         with patch.object(logger, "isEnabledFor", return_value=True), patch.object(logger, "debug") as debug:

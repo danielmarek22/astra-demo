@@ -19,7 +19,9 @@ from app.core import orchestrator_factory
 from app.demo.runtime import DemoRuntime
 from app.paths import STATE_ROOT, owned_state_path
 from app.server import create_app
+from app.tools.web.contracts import SearchResponse, WebSearchResult
 from tests.test_memory_store import FakeVectorStore
+from tests.support import buffered_generation
 
 
 class Vectors(FakeVectorStore):
@@ -34,20 +36,23 @@ class Model:
         self.release = None
         self.fail = False
         self.command = None
+        self.script = []
 
     def close(self):
         pass
 
-    def chat_buffered(self, messages, **kwargs):
+    def chat_buffered_result(self, messages, **kwargs):
         self.started.set()
         if self.release and not self.release.wait(5):
             raise TimeoutError("test model was not released")
         self.calls.append(messages)
         if self.fail:
             raise RuntimeError("Test model is unavailable")
+        if self.script:
+            return buffered_generation(self.script.pop(0))
         if self.command:
             command, self.command = self.command, None
-            return {
+            return buffered_generation({
                 "content": "",
                 "tool_calls": [
                     {
@@ -57,11 +62,15 @@ class Model:
                         }
                     }
                 ],
-            }
-        return {"content": "A practical plan from the demo model.", "tool_calls": []}
+            })
+        return buffered_generation({"content": "A practical plan from the demo model.", "tool_calls": []})
 
     def resolve_think_value(self, value=None):
         return False
+
+
+def tool_call(name, arguments):
+    return {"tool_calls": [{"function": {"name": name, "arguments": arguments}}]}
 
 
 class Speech:
@@ -217,7 +226,7 @@ class DemoTests(unittest.TestCase):
 
 class DemoHTTPTests(unittest.TestCase):
     def setUp(self):
-        config = Config("app/config/assistant-template.yaml")
+        self.config = Config("app/config/assistant-template.yaml")
         self.models = []
 
         def build_model(**kwargs):
@@ -234,12 +243,78 @@ class DemoHTTPTests(unittest.TestCase):
         ]:
             item.start()
             self.addCleanup(item.stop)
-        self.app = create_app(config, speech_builder=Speech)
-        self.client = TestClient(self.app)
+        self.app = create_app(self.config, speech_builder=Speech)
+        self.client = TestClient(self.app, base_url="http://localhost")
         self.client.__enter__()
         self.addCleanup(self.client.__exit__, None, None, None)
         self.generation = self.client.get("/api/status").json()["generation"]
         self.headers = {"X-Demo-Generation": self.generation}
+
+    def test_seeded_history_is_available_to_native_tools_from_a_new_conversation(self):
+        rows = self.client.get("/api/sessions/sample-observatory", headers=self.headers).json()["messages"]
+        ref = f"message:{rows[0]['id']}"
+        model = self.models[-1]
+        model.script = [
+            tool_call("history__search", {"query": "observatory decision", "limit": 8}),
+            tool_call("history__read", {"ref": ref}),
+            {"content": "We decided to borrow equipment first."},
+        ]
+        session = self.client.post("/api/sessions", headers=self.headers).json()["session_id"]
+        response = self.client.post(f"/api/sessions/{session}/messages", headers=self.headers,
+                                    json={"text": "Find our observatory decision."})
+        self.assertEqual(response.status_code, 200, response.text)
+        final = [event for line in response.text.splitlines()
+                 if (event := json.loads(line)).get("is_final")]
+        self.assertEqual(final[0]["text"], "We decided to borrow equipment first.")
+        observations = [message["content"] for message in model.calls[-1] if message["role"] == "tool"]
+        self.assertEqual(len(observations), 2)
+        self.assertIn('"kind":"history_search"', observations[0])
+        self.assertIn(ref, observations[0])
+        self.assertIn('"kind":"history_window"', observations[1])
+        self.assertIn("borrow equipment before buying anything", observations[1])
+
+    def test_web_sources_are_streamed_and_restored_with_the_answer(self):
+        self.config.integrations["web"]["enabled"] = True
+        source = WebSearchResult("Workshop guide", "https://example.org/workshop", "Repair guidance.")
+        search_response = SearchResponse((source,), "2026-11-18T00:00:00Z")
+        with patch("app.tools.web_search.SearXNGClient.search", return_value=search_response):
+            reset = self.client.post("/api/reset", headers=self.headers)
+            self.assertEqual(reset.status_code, 200, reset.text)
+            headers = {"X-Demo-Generation": reset.json()["generation"]}
+            model = self.models[-1]
+            model.script = [
+                tool_call("web__search", {"query": "workshop repair guidance"}),
+                {"content": "The guide describes basic repairs."},
+            ]
+            endpoint = "/api/sessions/sample-workshop"
+            response = self.client.post(f"{endpoint}/messages", headers=headers,
+                                        json={"text": "Find a repair guide."})
+            self.assertEqual(response.status_code, 200, response.text)
+            final = [event for line in response.text.splitlines()
+                     if (event := json.loads(line)).get("is_final")]
+            self.assertIn("[Workshop guide](<https://example.org/workshop>)", final[0]["text"])
+            saved = self.client.get(endpoint, headers=headers).json()["messages"][-1]
+            self.assertEqual(saved["content"], final[0]["text"])
+
+    def test_mcp_settings_use_only_the_current_workspace_and_reset(self):
+        launch_config = self.config.path.read_bytes()
+        self.assertEqual(self.client.get("/api/mcp", headers=self.headers).status_code, 403)
+        headers = {**self.headers, "X-Astra-MCP-Client": "1"}
+        state = self.client.get("/api/mcp", headers=headers).json()
+        self.assertFalse(state["enabled"])
+        self.assertEqual(state["servers"], [])
+        payload = {"enabled": True, "revision": state["revision"]}
+        self.assertEqual(self.client.put("/api/mcp", headers=headers, json=payload).status_code, 403)
+        headers["X-Astra-MCP-Token"] = state["csrf_token"]
+        enabled = self.client.put("/api/mcp", headers=headers, json=payload)
+        self.assertEqual(enabled.status_code, 200, enabled.text)
+        self.assertTrue(enabled.json()["enabled"])
+        reset = self.client.post("/api/reset", headers=self.headers)
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertEqual(self.client.get("/api/mcp", headers=headers).status_code, 409)
+        headers["X-Demo-Generation"] = reset.json()["generation"]
+        self.assertFalse(self.client.get("/api/mcp", headers=headers).json()["enabled"])
+        self.assertEqual(self.config.path.read_bytes(), launch_config)
 
     def test_stream_persists_and_reset_fences_stale_clients(self):
         response = self.client.post(
@@ -592,6 +667,32 @@ class DemoCancellationTests(unittest.IsolatedAsyncioTestCase):
         status = (await self.client.get("/api/status")).json()
         self.assertFalse(status["busy"])
         self.assertNotEqual(status["generation"], self.generation)
+
+    async def test_disconnected_mcp_request_keeps_the_workspace_until_completion(self):
+        management = self.app.state.runtime.current.mcp_management
+        entered, release = threading.Event(), threading.Event()
+        original_view = management.view
+
+        def slow_view():
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release MCP management")
+            return original_view()
+
+        headers = {**self.headers, "X-Astra-MCP-Client": "1"}
+        with patch.object(management, "view", side_effect=slow_view):
+            task = asyncio.create_task(self.client.get("http://localhost/api/mcp", headers=headers))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue((await self.client.get("/api/status")).json()["busy"])
+                self.assertEqual((await self.client.post("/api/reset", headers=self.headers)).status_code, 409)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*self.app.state.turn_tasks), 5)
+        self.assertFalse((await self.client.get("/api/status")).json()["busy"])
 
     async def wait_for_approval(self):
         for _ in range(100):

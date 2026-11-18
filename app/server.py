@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import secrets
 import threading
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -12,6 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Path, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.datastructures import MutableHeaders
 
 from app.config import Config
 from app.core.orchestrator_factory import build_orchestrator, validate_demo_config
@@ -24,6 +26,7 @@ from app.http.message_input import _validate_attachment_batch
 from app.perception.attachments import ImageAttachment, attachment_from_payload
 from app.tts.text import _prepare_tts_text
 from app.http.knowledge import router as knowledge_router
+from app.http.mcp import router as mcp_router
 from app.logging import setup_logging_from_config
 from app.paths import STATIC_DIR, owned_state_path
 
@@ -49,6 +52,54 @@ class ApprovalResponse(BaseModel):
 class SpeechRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     message_id: int = Field(gt=0)
+
+
+class SameOriginMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Cache-Control"] = "no-store"
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["Content-Security-Policy"] = (
+                    "default-src 'self'; script-src 'self'; style-src 'self'; "
+                    "img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; "
+                    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+                )
+            await send(message)
+
+        request = Request(scope)
+        origin = request.headers.get("origin")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and origin:
+            try:
+                parsed = urlsplit(origin)
+                valid_origin = parsed.scheme == request.url.scheme and parsed.netloc == request.url.netloc
+            except ValueError:
+                valid_origin = False
+            if not valid_origin:
+                response = JSONResponse({"detail": "Use the demo from its own origin."}, status_code=403)
+                await response(scope, receive, send_with_headers)
+                return
+        await self.app(scope, receive, send_with_headers)
+
+
+class TurnStream(StreamingResponse):
+    def __init__(self, content, on_close):
+        super().__init__(content, media_type="application/x-ndjson")
+        self.on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.on_close()
 
 
 def _check_generation(runtime, generation):
@@ -98,6 +149,23 @@ async def workspace(request: Request, x_demo_generation: Annotated[str, Header()
         runtime.gate.release()
 
 
+async def _run_mcp(request: Request, method: str, *args):
+    runtime = _runtime(request)
+    _acquire(runtime, request.headers.get("x-demo-generation"))
+    management = runtime.current.mcp_management
+    if management is None:
+        runtime.gate.release()
+        raise HTTPException(503, "MCP management is unavailable.")
+
+    async def work():
+        try:
+            return await asyncio.to_thread(getattr(management, method), *args)
+        finally:
+            runtime.gate.release()
+
+    return await asyncio.shield(_owned_task(request.app, work()))
+
+
 def create_app(
     settings: Config | None = None,
     *,
@@ -114,6 +182,7 @@ def create_app(
         runtime = DemoRuntime(config, builder=orchestrator_builder)
         application.state.runtime = runtime
         application.state.turn_tasks = set()
+        application.state.mcp_token = secrets.token_urlsafe(32)
         application.state.approvals = ApprovalBroker(
             config.autonomy["approval_timeout_s"]
         )
@@ -131,27 +200,8 @@ def create_app(
             await asyncio.to_thread(runtime.close)
 
     application = FastAPI(title="Astra Demo", lifespan=lifespan)
-
-    @application.middleware("http")
-    async def same_origin(request: Request, call_next):
-        origin = request.headers.get("origin")
-        if request.method not in {"GET", "HEAD", "OPTIONS"} and origin:
-            parsed = urlsplit(origin)
-            if (
-                parsed.scheme != request.url.scheme
-                or parsed.netloc != request.url.netloc
-            ):
-                return JSONResponse(
-                    {"detail": "Use the demo from its own origin."}, status_code=403
-                )
-        response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-        )
-        return response
+    application.state.run_mcp = _run_mcp
+    application.add_middleware(SameOriginMiddleware)
 
     application.mount(
         "/static",
@@ -159,6 +209,7 @@ def create_app(
         name="static",
     )
     application.include_router(knowledge_router, dependencies=[Depends(workspace)])
+    application.include_router(mcp_router)
 
     @application.get("/")
     async def index():
@@ -177,6 +228,9 @@ def create_app(
                 "speech_input": runtime.settings.stt["enabled"],
                 "speech_output": runtime.settings.tts["enabled"],
                 "shell": runtime.settings.integrations["shell"]["enabled"],
+                "history": runtime.settings.integrations["history"]["enabled"],
+                "web": runtime.settings.integrations["web"]["enabled"],
+                "mcp_management": current is not None and current.mcp_management is not None,
             },
             "notice": current.manifest["notice"]
             if current
@@ -407,7 +461,7 @@ def create_app(
         disconnected = threading.Event()
         broker = request.app.state.approvals
 
-        def approve_command(payload):
+        def approve_tool(payload):
             if disconnected.is_set():
                 return False
             return asyncio.run_coroutine_threadsafe(
@@ -437,7 +491,7 @@ def create_app(
                     text,
                     existing_user_message_id=payload.retry_message_id,
                     attachments=attachments,
-                    tool_approval_callback=approve_command,
+                    tool_approval_callback=approve_tool,
                 ):
                     image_dropped |= any(
                         getattr(orchestrator.llm, flag, False) for flag in flags
@@ -484,17 +538,17 @@ def create_app(
         async def stream():
             # The owned task continues to finalization after a client disconnect.
             # Reset stays busy until it has stopped touching the old stores.
-            try:
-                while True:
-                    item = await queue.get()
-                    yield json.dumps(item, ensure_ascii=False) + "\n"
-                    if item["type"] == "done":
-                        break
-            finally:
-                disconnected.set()
-                broker.disconnect(current.id, session_id, x_demo_client)
+            while True:
+                item = await queue.get()
+                yield json.dumps(item, ensure_ascii=False) + "\n"
+                if item["type"] == "done":
+                    break
 
-        return StreamingResponse(stream(), media_type="application/x-ndjson")
+        def close_stream():
+            disconnected.set()
+            broker.disconnect(current.id, session_id, x_demo_client)
+
+        return TurnStream(stream(), close_stream)
 
     return application
 

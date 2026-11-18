@@ -6,7 +6,7 @@ import uuid
 from typing import Iterator
 
 from . import image_fallback
-from .base import InferenceFailure, LLMClient
+from .base import BufferedGeneration, InferenceFailure, LLMClient
 from .stream_decoder import decode_buffered_chunk, decode_chunk
 from app.llm.thinking_filter import ThinkingBlockSplitter
 from app.logging import trace_event, trace_thinking_output
@@ -128,6 +128,10 @@ class OllamaClient(LLMClient):
 
     def close(self) -> None:
         self.session.close()
+
+    def generation_options(self, think_override=None, options_override=None) -> dict:
+        think_value = self._resolve_think_value(think_override)
+        return self._normalize_options(self._merge_options(self._build_stream_options(think_value), options_override))
 
     # ------------------------------------------------------------------
     # LLMClient interface
@@ -271,14 +275,33 @@ class OllamaClient(LLMClient):
         react_iteration: int | None = None,
         telemetry_session_id: str | None = None,
     ) -> dict:
-        """Consume a native streamed generation atomically before exposing its result."""
+        """Keep the message-only contract over the single buffered implementation."""
+        return self.chat_buffered_result(
+            messages, think_override=think_override, options_override=options_override,
+            timeout_override=timeout_override, generation_deadline_s=generation_deadline_s,
+            tools=tools, generation_phase=generation_phase, react_iteration=react_iteration,
+            telemetry_session_id=telemetry_session_id,
+        ).message
+
+    def chat_buffered_result(
+        self,
+        messages,
+        think_override=None,
+        options_override: dict | None = None,
+        timeout_override: float | None = None,
+        generation_deadline_s: float | None = 120.0,
+        tools: list[dict] | None = None,
+        generation_phase: str | None = None,
+        react_iteration: int | None = None,
+        telemetry_session_id: str | None = None,
+    ) -> BufferedGeneration:
+        """Consume one complete native stream, including its terminal metadata."""
         trace_context = self._new_trace_context(
             "buffered", telemetry_session_id,
             generation_phase=generation_phase, react_iteration=react_iteration,
         )
         think_value = self._resolve_think_value(think_override)
-        request_options = self._build_stream_options(think_value)
-        request_options = self._merge_options(request_options, options_override)
+        request_options = self.generation_options(think_override, options_override)
         payload = self._build_payload(
             messages,
             stream=True,
@@ -431,7 +454,17 @@ class OllamaClient(LLMClient):
             react_iteration=react_iteration,
             telemetry_session_id=telemetry_session_id,
         )
-        return message
+        return BufferedGeneration(
+            message=message,
+            done_reason=final_chunk.get("done_reason") if isinstance(final_chunk.get("done_reason"), str) else None,
+            prompt_tokens=self._token_count(final_chunk.get("prompt_eval_count")),
+            generated_tokens=self._token_count(final_chunk.get("eval_count")),
+            inference_id=trace_context["inference_id"],
+        )
+
+    @staticmethod
+    def _token_count(value) -> int | None:
+        return value if type(value) is int and value >= 0 else None
 
     def stream_chat(
         self, 
@@ -451,8 +484,7 @@ class OllamaClient(LLMClient):
         """
         trace_context = self._new_trace_context("streaming", telemetry_session_id)
         think_value = self._resolve_think_value(think_override)
-        request_options = self._build_stream_options(think_value)
-        request_options = self._merge_options(request_options, options_override)
+        request_options = self.generation_options(think_override, options_override)
         fallback = image_fallback.ImageFallback(
             messages, multimodal_supported=self._multimodal_supported,
         )

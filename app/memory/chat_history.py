@@ -21,11 +21,25 @@ from app.core.conversation import (
     SessionKind,
 )
 from app.core.session_ids import validate_session_id
+from app.core.turn_completion import AuthoritativeTurnContext
 from app.paths import STATIC_DIR
 from app.memory.attachment_files import AttachmentFiles
 
 
 logger = logging.getLogger("chat_history")
+
+HISTORY_QUERY_CHARS = 2000
+HISTORY_MAX_RESULTS = 8
+HISTORY_WINDOW_RADIUS = 3
+HISTORY_CANDIDATES = 64
+
+
+class HistoryAccessDenied(PermissionError):
+    pass
+
+
+class HistoryReferenceNotFound(LookupError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -55,7 +69,16 @@ class ChatHistoryStore:
         local_assistant_id: str = "default-agent",
         local_assistant_name: str = "Astra",
         episodic_max_distance: float = 0.70,
+        trusted_session_ids: tuple[str, ...] | list[str] = (),
+        allow_all_sessions: bool = False,
     ):
+        if type(allow_all_sessions) is not bool:
+            raise ValueError("allow_all_sessions must be a Boolean")
+        self._allow_all_history_sessions = allow_all_sessions
+        if not isinstance(trusted_session_ids, (list, tuple)):
+            raise ValueError("trusted_session_ids must be a list or tuple of session IDs")
+        # Owner-managed startup policy, never derived from a tool argument or a speaker name.
+        self._trusted_history_session_ids = frozenset(validate_session_id(value) for value in trusted_session_ids)
         self.db = db
         self.vector_store = vector_store
         self.collection = self.vector_store.episodic_collection
@@ -669,6 +692,188 @@ class ChatHistoryStore:
             },
         )
         return filtered_docs
+
+    def _history_authority(self, conn, session_id, turn):
+        """Validate application authority against the accepted canonical input."""
+        if (not isinstance(turn, AuthoritativeTurnContext) or turn.session_id != session_id
+                or turn.owner_agent_id != self.local_assistant_id
+                or type(turn.user_message_id) is not int or not 0 < turn.user_message_id <= 2**63 - 1
+                or turn.sender_type not in {SenderType.HUMAN, SenderType.EXTERNAL_AGENT}
+                or turn.input_source not in {InputSource.LOCAL_TEXT, InputSource.LOCAL_VOICE, InputSource.MANUAL_RELAY}):
+            raise HistoryAccessDenied("History requires an accepted participant turn")
+        row = conn.execute(
+            """SELECT ch.sender_id, ch.sender_type, ch.input_source, cs.kind
+               FROM chat_history ch JOIN chat_sessions cs ON cs.session_id = ch.session_id
+               WHERE ch.id = ? AND ch.session_id = ? AND ch.role = 'user' AND ch.excluded_from_context = 0
+                 AND NOT EXISTS (SELECT 1 FROM deleted_sessions ds WHERE ds.session_id = ch.session_id)""",
+            (turn.user_message_id, session_id),
+        ).fetchone()
+        if row is None or (row["sender_id"], row["sender_type"], row["input_source"], row["kind"]) != (
+                turn.sender_id, turn.sender_type.value, turn.input_source.value, turn.session_kind.value):
+            raise HistoryAccessDenied("History requires an accepted participant turn")
+        return (turn.session_kind is SessionKind.DIRECT and turn.sender_id == self.local_human_id
+                and turn.sender_type is SenderType.HUMAN
+                and turn.input_source in {InputSource.LOCAL_TEXT, InputSource.LOCAL_VOICE}
+                and self._history_private_direct(conn, session_id))
+
+    def _history_private_direct(self, conn, session_id):
+        # Missing/legacy attribution never establishes cross-session ownership.
+        # Inspect excluded rows too: hiding a participant's message is not an ACL change.
+        row = conn.execute(
+            """SELECT 1 FROM chat_sessions cs WHERE cs.session_id = ? AND cs.kind = 'direct'
+               AND NOT EXISTS (SELECT 1 FROM deleted_sessions ds WHERE ds.session_id = cs.session_id)
+               AND EXISTS (SELECT 1 FROM chat_history ch WHERE ch.session_id = cs.session_id
+                           AND ch.role = 'user' AND ch.sender_id = ? AND ch.sender_type = 'human'
+                           AND ch.input_source IN ('local_text', 'local_voice'))
+               AND NOT EXISTS (
+                   SELECT 1 FROM chat_history ch WHERE ch.session_id = cs.session_id AND ch.role IN ('user', 'assistant')
+                   AND NOT COALESCE(
+                       (ch.role = 'user' AND ch.sender_id = ? AND ch.sender_type = 'human'
+                        AND ch.input_source IN ('local_text', 'local_voice'))
+                       OR (ch.role = 'assistant' AND ch.sender_id = ? AND ch.sender_type = 'local_assistant'
+                           AND ch.input_source = 'assistant_generation'), 0))""",
+            (session_id, self.local_human_id, self.local_human_id, self.local_assistant_id),
+        ).fetchone()
+        return row is not None
+
+    def can_retrieve_history(self, session_id, turn):
+        try:
+            with self.db.connection() as conn:
+                self._history_authority(conn, validate_session_id(session_id), turn)
+            return True
+        except (HistoryAccessDenied, ValueError):
+            return False
+
+    @staticmethod
+    def _history_reference(reference, sources=("message",)):
+        if not isinstance(reference, str):
+            return None
+        source, separator, raw_id = reference.partition(":")
+        if (not separator or source not in sources or not raw_id.isascii() or not raw_id.isdecimal()
+                or not 1 <= len(raw_id) <= 19):
+            return None
+        value = int(raw_id)
+        return (source, value) if 0 < value <= 2**63 - 1 and str(value) == raw_id else None
+
+    @staticmethod
+    def _history_row(conn, message_id, before_id):
+        return conn.execute(
+            """SELECT id, session_id, role, substr(content, 1, 1201) AS content, length(content) AS content_chars,
+                      timestamp, sender_id, sender_display_name, sender_type, input_source
+               FROM chat_history ch WHERE id = ? AND id < ? AND excluded_from_context = 0
+                 AND role IN ('user', 'assistant')
+                 AND NOT EXISTS (SELECT 1 FROM deleted_sessions ds WHERE ds.session_id = ch.session_id)""",
+            (message_id, before_id),
+        ).fetchone()
+
+    def _history_readable(self, conn, row, current_session, cross_session):
+        return row is not None and (row["session_id"] == current_session
+                                   or (cross_session and (
+                                       self._history_private_direct(conn, row["session_id"])
+                                       or self._history_trusted_archive(conn, row["session_id"]))))
+
+    def _history_trusted_archive(self, conn, session_id):
+        if not self._allow_all_history_sessions and session_id not in self._trusted_history_session_ids:
+            return False
+        return conn.execute(
+            """SELECT 1 FROM chat_sessions cs WHERE cs.session_id = ? AND cs.kind IN ('direct', 'manual_group')
+               AND NOT EXISTS (SELECT 1 FROM deleted_sessions ds WHERE ds.session_id = cs.session_id)""",
+            (session_id,),
+        ).fetchone() is not None
+
+    def _history_record(self, conn, row, text_chars):
+        item = dict(row)
+        # Legacy attribution may be absent. Never invent a speaker for historical evidence.
+        sender = {key: item[column][:limit] if item[column] else None for key, column, limit in (
+            ("id", "sender_id", 128), ("display_name", "sender_display_name", 80),
+            ("type", "sender_type", 64), ("input_source", "input_source", 64),
+        )}
+        attachments = conn.execute(
+            """SELECT substr(name, -160) AS name, substr(mime_type, 1, 128) AS mime_type,
+                      substr(summary_text, 1, 301) AS summary_text, length(summary_text) AS summary_chars
+               FROM chat_attachments WHERE message_id = ? AND session_id = ? ORDER BY id LIMIT 4""",
+            (item["id"], item["session_id"]),
+        ).fetchall()
+        return {
+            "ref": message_vector_id(item["id"]), "message_id": item["id"], "session_id": item["session_id"],
+            "role": item["role"], "timestamp": str(item["timestamp"])[:64],
+            "sender": sender,
+            "text": item["content"][:text_chars],
+            "truncated": (item["content_chars"] > text_chars or len(attachments) > 3
+                          or any((attachment["summary_chars"] or 0) > 300 for attachment in attachments[:3])),
+            "attachments": [{"name": attachment["name"].replace("\\", "/").rsplit("/", 1)[-1],
+                             "mime_type": attachment["mime_type"], "summary": (attachment["summary_text"] or "")[:300],
+                             "truncated": (attachment["summary_chars"] or 0) > 300} for attachment in attachments[:3]],
+        }
+
+    def search_history(self, query, session_id, turn, limit=5):
+        """On-demand episodic candidates, including this session; canonical authorization is mandatory."""
+        session_id = validate_session_id(session_id)
+        if not isinstance(query, str) or not query.strip() or len(query) > HISTORY_QUERY_CHARS:
+            raise ValueError("History query must contain 1-2000 characters")
+        if type(limit) is not int or not 1 <= limit <= HISTORY_MAX_RESULTS:
+            raise ValueError("Invalid history result limit")
+        with self.db.connection() as conn:
+            cross_session = self._history_authority(conn, session_id, turn)
+        count = min(self.collection.count(), HISTORY_CANDIDATES)
+        results = self.collection.query(
+            query_texts=[query.strip()], n_results=count, include=["distances"],
+            where={"role": {"$in": ["user", "assistant"]}} if cross_session else {"session_id": session_id},
+        ) if count else {}
+        matches, seen = [], set()
+        with self.db.connection() as conn:
+            # Vector lookup may run concurrently with deletion or session changes.
+            cross_session = self._history_authority(conn, session_id, turn)
+            for reference, distance in ranked_candidates(results, HISTORY_CANDIDATES):
+                if distance > self.episodic_max_distance:
+                    continue
+                parsed = self._history_reference(reference, ("message", "attachment"))
+                if parsed is None:
+                    continue
+                source, message_id = parsed
+                if source == "attachment":
+                    attachment = conn.execute(
+                        """SELECT message_id, session_id FROM chat_attachments WHERE id = ?
+                           AND summary_text IS NOT NULL AND summary_text != ''""", (message_id,),
+                    ).fetchone()
+                    if attachment is None:
+                        continue
+                    message_id = attachment["message_id"]
+                row = self._history_row(conn, message_id, turn.user_message_id)
+                if source == "attachment" and row is not None and row["session_id"] != attachment["session_id"]:
+                    continue
+                if message_id in seen or not self._history_readable(conn, row, session_id, cross_session):
+                    continue
+                seen.add(message_id)
+                record = self._history_record(conn, row, 400)
+                record["distance"] = distance
+                matches.append(record)
+                if len(matches) == limit:
+                    break
+        return {"kind": "history_search", "untrusted": True, "matches": matches}
+
+    def read_history(self, reference, session_id, turn, before=2, after=2):
+        session_id = validate_session_id(session_id)
+        if any(type(value) is not int or not 0 <= value <= HISTORY_WINDOW_RADIUS for value in (before, after)):
+            raise ValueError("Invalid history window size")
+        with self.db.connection() as conn:
+            cross_session = self._history_authority(conn, session_id, turn)
+            parsed = self._history_reference(reference)
+            row = self._history_row(conn, parsed[1], turn.user_message_id) if parsed else None
+            if not self._history_readable(conn, row, session_id, cross_session):
+                raise HistoryReferenceNotFound("History reference is unavailable or not accessible")
+            records = []
+            for operator, order, size in (("<", "DESC", before), (">", "ASC", after)):
+                # Operators/order are fixed runtime values; all identifiers are bound parameters.
+                neighbors = conn.execute(
+                    f"""SELECT id FROM chat_history WHERE session_id = ? AND id {operator} ? AND id < ?
+                        AND role IN ('user', 'assistant') AND excluded_from_context = 0
+                        ORDER BY id {order} LIMIT ?""", (row["session_id"], row["id"], turn.user_message_id, size),
+                ).fetchall()
+                records.extend(self._history_row(conn, neighbor["id"], turn.user_message_id) for neighbor in neighbors)
+            records.append(row)
+            return {"kind": "history_window", "untrusted": True, "anchor_ref": reference,
+                    "messages": [self._history_record(conn, item, 1200) for item in sorted(records, key=lambda item: item["id"])]}
 
     def _canonical_episodic_document(self, conn, vector_id: str, current_session: str) -> str | None:
         source, separator, raw_id = vector_id.partition(":")

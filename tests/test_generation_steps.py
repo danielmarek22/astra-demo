@@ -7,16 +7,19 @@ from app.core.events import (
     AvatarAnimationEvent, AvatarExpressionEvent,
 )
 from app.core.generation_step import AcceptedToolCall, FinalText, InvalidToolCall
+from app.llm.base import InferenceFailure
 from app.core.response_generator import ResponseGenerator
 from tests.support import consume_generator as consume
+from tests.support import BufferedResultMock, rendered_step
 
 
 class GenerationStepTests(unittest.TestCase):
     def generator(self, *, chunks=(), messages=()):
         llm = SimpleNamespace(
             resolve_think_value=lambda override: True if override is None else override,
+            generation_options=lambda *_args: {"num_ctx": 32768, "num_predict": 2048},
             stream_chat=Mock(side_effect=lambda *args, **kwargs: iter(chunks)),
-            chat_buffered=Mock(side_effect=list(messages)),
+            chat_buffered_result=BufferedResultMock(side_effect=list(messages)),
         )
         executor = SimpleNamespace(get_native_tools=Mock(return_value=[]), execute=Mock())
         return ResponseGenerator(llm, executor, Mock(), allowed_animations={"wave"})
@@ -40,7 +43,7 @@ class GenerationStepTests(unittest.TestCase):
                 self.assertEqual(events, [AssistantStateEvent(state="responding"), *render_events])
                 self.assertEqual(result, "Hi")
         generator = self.generator(messages=[{"content": text}])
-        events, result = consume(generator._stream_late_routing_step("s", [], "Hi"))
+        events, result = consume(rendered_step(generator, "s", [], "Hi"))
         self.assertEqual(events, [
             AssistantStateEvent(state="thinking"), AssistantStateEvent(state="responding"), *expected,
         ])
@@ -54,7 +57,7 @@ class GenerationStepTests(unittest.TestCase):
                 self.assertEqual(events, [AssistantStateEvent(state="responding"),
                                           AvatarExpressionEvent(expression="neutral")])
                 self.assertEqual(response, "")
-                events, result = consume(generator._stream_late_routing_step("s", [], "Hi"))
+                events, result = consume(rendered_step(generator, "s", [], "Hi"))
                 expected = [AssistantStateEvent(state="thinking")]
                 if text:
                     expected += [AssistantStateEvent(state="responding"),
@@ -66,7 +69,7 @@ class GenerationStepTests(unittest.TestCase):
         generator = self.generator(chunks=["[wave]"], messages=[{"content": "[wave]"}])
         expected = [AvatarAnimationEvent(animation="wave"), AvatarExpressionEvent(expression="neutral")]
         direct_events, response = consume(generator.stream_response("s", []))
-        buffered_events, result = consume(generator._stream_late_routing_step("s", [], "Hi"))
+        buffered_events, result = consume(rendered_step(generator, "s", [], "Hi"))
         self.assertEqual(direct_events[1:], expected)
         self.assertEqual(buffered_events[2:], expected)
         self.assertEqual(response, "")
@@ -78,7 +81,7 @@ class GenerationStepTests(unittest.TestCase):
         expected = [AvatarExpressionEvent(expression="neutral"),
                     AssistantSpeechEvent(text="Hi "), AssistantSpeechEvent(text="[unfinished")]
         direct_events, response = consume(generator.stream_response("s", []))
-        buffered_events, result = consume(generator._stream_late_routing_step("s", [], "Hi"))
+        buffered_events, result = consume(rendered_step(generator, "s", [], "Hi"))
         self.assertEqual(direct_events[1:], expected)
         self.assertEqual(buffered_events[2:], expected)
         self.assertEqual(response, text)
@@ -93,7 +96,7 @@ class GenerationStepTests(unittest.TestCase):
             AvatarExpressionEvent(expression="neutral"), AssistantSpeechEvent(text="Hi"),
         ])
         self.assertEqual(response, "Hi")
-        events, result = consume(generator._stream_late_routing_step("s", [], "Hi"))
+        events, result = consume(rendered_step(generator, "s", [], "Hi"))
         self.assertEqual(events, [
             AssistantStateEvent(state="thinking"), AssistantThinkingEvent(text="private"),
             AssistantStateEvent(state="responding"), AvatarExpressionEvent(expression="neutral"),
@@ -110,10 +113,12 @@ class GenerationStepTests(unittest.TestCase):
                 {"function": {"name": "demo__second", "arguments": {}}},
             ],
         }])
-        events, result = consume(generator._stream_late_routing_step("s", [], "Hi"))
+        events, result = consume(rendered_step(generator, "s", [], "Hi"))
         self.assertIsInstance(result, AcceptedToolCall)
         self.assertEqual(result.tool_name, "shell__execute")
         self.assertIs(result.tool_arguments, arguments)
+        self.assertEqual(result.continuation.thinking, "private")
+        self.assertEqual(result.continuation.content, "Do not emit [wave]")
         self.assertEqual(events, [AssistantStateEvent(state="thinking"),
                                   AssistantThinkingEvent(text="private")])
         generator.tool_executor.execute.assert_not_called()
@@ -129,7 +134,7 @@ class GenerationStepTests(unittest.TestCase):
                     "content": "Must stay hidden",
                     "tool_calls": [{"function": {"name": name, "arguments": arguments}}],
                 }])
-                events, result = consume(generator._stream_late_routing_step("s", [], "Hi"))
+                events, result = consume(rendered_step(generator, "s", [], "Hi"))
                 self.assertIsInstance(result, InvalidToolCall)
                 self.assertEqual(result.tool_name, name)
                 self.assertIs(result.tool_arguments, arguments)
@@ -139,7 +144,8 @@ class GenerationStepTests(unittest.TestCase):
     def test_invalid_belief_arguments_reach_correction_without_execution(self):
         raw_arguments = ["original evidence"]
         generator = self.generator(messages=[
-            {"tool_calls": [{"function": {"name": "beliefs__update", "arguments": raw_arguments}}]},
+            {"thinking": "Belief plan", "content": "Hidden preamble",
+             "tool_calls": [{"function": {"name": "beliefs__update", "arguments": raw_arguments}}]},
             {"content": "Please clarify."},
         ])
         messages = []
@@ -150,9 +156,26 @@ class GenerationStepTests(unittest.TestCase):
         self.assertIs(assistant["tool_calls"][0]["function"]["arguments"], raw_arguments)
         observation = next(message for message in messages if message["role"] == "tool")
         self.assertIn("Tool arguments must be an object", observation["content"])
-        calls = generator.llm.chat_buffered.call_args_list
+        calls = generator.llm.chat_buffered_result.call_args_list
         self.assertEqual([call.kwargs["generation_phase"] for call in calls], ["initial", "correction"])
         self.assertIs(calls[1].kwargs["think_override"], False)
+        replayed = next(message for message in calls[1].kwargs["messages"] if message.get("tool_calls"))
+        self.assertEqual(replayed["thinking"], "Belief plan")
+        self.assertEqual(replayed["content"], "Hidden preamble")
+        self.assertEqual(calls[1].kwargs["options_override"], {"num_predict": 512})
+
+    def test_malformed_continuation_never_exposes_thinking_or_a_partial_call(self):
+        for field, value in (("thinking", ["invalid"]), ("content", {"invalid": "content"}),
+                             ("thinking", None), ("content", 17)):
+            with self.subTest(field=field, value=value):
+                message = {"thinking": "Private", "content": "Preamble",
+                           "tool_calls": [{"function": {"name": "demo__run", "arguments": {}}}], field: value}
+                generator = self.generator(messages=[message])
+                pending = generator._stream_late_routing_step("s", [], "Question")
+                self.assertEqual(next(pending), AssistantStateEvent(state="thinking"))
+                with self.assertRaises(InferenceFailure):
+                    next(pending)
+                generator.tool_executor.execute.assert_not_called()
 
 
 if __name__ == "__main__":

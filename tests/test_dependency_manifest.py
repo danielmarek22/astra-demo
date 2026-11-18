@@ -12,7 +12,7 @@ RUNTIME_GROUPS = (
 EXPECTED_OWNERS = {
     "requirements-media.txt": {"faster-whisper", "kokoro", "soundfile", "av"},
     "requirements-core.txt": {
-        "chromadb", "emoji", "fastapi", "jsonschema", "pillow", "pydantic",
+        "chromadb", "emoji", "fastapi", "httpx", "jsonschema", "pillow", "pydantic",
         "pyyaml", "requests", "rich", "sentence-transformers", "torch",
         "transformers", "uvicorn",
     },

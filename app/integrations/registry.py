@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+import threading
+from copy import deepcopy
+from dataclasses import replace
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 
@@ -19,6 +22,7 @@ from app.integrations.contracts import (
     InvocationContext,
     RegisteredTool,
     ToolCall,
+    ToolCatalogSnapshot,
     ToolResult,
     NotificationPolicy,
     ReplayPolicy,
@@ -35,6 +39,9 @@ class IntegrationRegistry:
         self._tools: dict[CapabilityId, RegisteredTool] = {}
         self._events: dict[EventId, EventSpec] = {}
         self._started = False
+        self._lock = threading.RLock()
+        self._snapshot_owner = object()
+        self._revision = 0
 
         for integration in integrations:
             self.register(integration)
@@ -45,10 +52,26 @@ class IntegrationRegistry:
         if not isinstance(name, str) or not name:
             raise ValueError("Integration must declare a name")
         CapabilityId(name, "validation")
+        if name == "reasoning":
+            raise ValueError("The reasoning namespace is reserved for the execution runtime")
         if name in self._integrations:
             raise ValueError(f"Duplicate integration: {name}")
 
-        tools = integration.registered_tools()
+        pending = self._validated_tools(name, integration.registered_tools())
+        with self._lock:
+            if name in self._integrations:
+                raise ValueError(f"Duplicate integration: {name}")
+            self._integrations = {**self._integrations, name: integration}
+            self._tools = {**self._tools, **dict(pending)}
+            self._revision += 1
+
+        event_provider = getattr(integration, "registered_events", None)
+        if callable(event_provider):
+            for spec in event_provider():
+                self._register_event(name, spec)
+
+    @staticmethod
+    def _validated_tools(name, tools):
         pending: list[tuple[CapabilityId, RegisteredTool]] = []
         for registered in tools:
             if not isinstance(registered, RegisteredTool):
@@ -58,7 +81,7 @@ class IntegrationRegistry:
                 raise ValueError(
                     f"Capability {capability} does not belong to integration {name!r}"
                 )
-            if capability in self._tools or any(item[0] == capability for item in pending):
+            if any(item[0] == capability for item in pending):
                 raise ValueError(f"Duplicate capability: {capability}")
             if not callable(registered.handler):
                 raise ValueError(f"Capability {capability} has no callable handler")
@@ -71,15 +94,45 @@ class IntegrationRegistry:
                 Draft202012Validator.check_schema(dict(schema))
             except SchemaError as exc:
                 raise ValueError(f"Capability {capability} has an invalid input schema") from exc
-            pending.append((capability, registered))
+            if type(registered.enabled) is not bool or type(registered.redact_logs) is not bool:
+                raise ValueError("Tool enablement and log policy must be boolean")
+            pending.append((capability, replace(registered, spec=replace(registered.spec, input_schema=deepcopy(dict(schema))))))
 
-        self._integrations[name] = integration
-        self._tools.update(pending)
+        return pending
 
-        event_provider = getattr(integration, "registered_events", None)
-        if callable(event_provider):
-            for spec in event_provider():
-                self._register_event(name, spec)
+    def replace_tools(self, integration: Integration, tools: list[RegisteredTool]) -> None:
+        """Atomically publish one owner's tools. Validation and I/O hold no lock."""
+        name = integration.name
+        pending = dict(self._validated_tools(name, tools))
+        with self._lock:
+            if self._integrations.get(name) is not integration:
+                raise ValueError("Only the registered integration may replace its tools")
+            replacement = {key: item for key, item in self._tools.items() if key.integration != name}
+            replacement.update(pending)
+            if any(cap not in replacement for spec in self._events.values() for cap in spec.allowed_capabilities):
+                raise ValueError("Replacement would invalidate an event capability allowlist")
+            self._tools = replacement
+            self._revision += 1
+
+    def capture_tool_catalog(self) -> ToolCatalogSnapshot:
+        with self._lock:
+            return ToolCatalogSnapshot.capture(self._snapshot_owner, self._revision, self._tools)
+
+    def _catalog(self, context: InvocationContext | None) -> ToolCatalogSnapshot:
+        snapshot = context.tool_catalog if context is not None else None
+        if snapshot is None:
+            return self.capture_tool_catalog()
+        if (not isinstance(snapshot, ToolCatalogSnapshot) or snapshot.owner is not self._snapshot_owner
+                or snapshot.closed):
+            raise ValueError("Tool catalog belongs to another registry")
+        return snapshot
+
+    def redact_tool_logs(self, capability: CapabilityId, snapshot=None) -> bool:
+        # Unregistered names in a private integration also omit their arguments.
+        with self._lock:
+            integration = self._integrations.get(capability.integration)
+        registered = self._catalog(InvocationContext("", "", tool_catalog=snapshot)).lookup(capability)
+        return bool(getattr(integration, "redact_logs", False) or registered and registered.redact_logs)
 
     def get_native_tools(
         self,
@@ -87,8 +140,15 @@ class IntegrationRegistry:
         invocation_context: InvocationContext | None = None,
     ) -> list[dict]:
         native_tools = []
-        for capability, registered in sorted(self._tools.items()):
+        catalog = self._catalog(invocation_context)
+        for registered in catalog.tools():
+            capability = registered.spec.capability
+            if not registered.enabled:
+                continue
             if allowed_capabilities is not None and capability not in allowed_capabilities:
+                continue
+            if (invocation_context is not None and invocation_context.allowed_capabilities is not None
+                    and capability not in invocation_context.allowed_capabilities):
                 continue
             if not self._is_available(registered):
                 continue
@@ -160,7 +220,7 @@ class IntegrationRegistry:
         self._validate_event_allowlists()
         started: list[Integration] = []
         try:
-            for integration in self._integrations.values():
+            for integration in tuple(self._integrations.values()):
                 start = getattr(integration, "start", None)
                 if callable(start):
                     start(publisher)
@@ -181,17 +241,45 @@ class IntegrationRegistry:
             and call.capability not in context.allowed_capabilities
         ):
             return ToolResult.denied(f"Capability is not permitted for this invocation: {call.capability}")
-        registered = self._tools.get(call.capability)
+        try:
+            catalog = self._catalog(context)
+            registered = catalog.lookup(call.capability)
+        except ValueError:
+            return ToolResult.denied("Invalid invocation tool catalog")
         if registered is None:
             return ToolResult.error(f"Unknown capability: {call.capability}")
+        if not registered.enabled:
+            return ToolResult.denied(f"Capability is disabled: {call.capability}")
         if not self._is_available(registered):
             return ToolResult.unavailable(f"Capability is unavailable: {call.capability}")
         if not isinstance(call.arguments, Mapping):
             return ToolResult.error(f"Invalid arguments for {call.capability}: expected an object")
 
         try:
-            Draft202012Validator(dict(registered.spec.input_schema)).validate(dict(call.arguments))
+            arguments = deepcopy(dict(call.arguments))
+        except (TypeError, ValueError, RecursionError):
+            return ToolResult.error("Tool arguments could not be copied safely")
+        try:
+            if call.capability.integration == "mcp":
+                from app.integrations.mcp import (
+                    MCPArgumentLimit,
+                    validate_mcp_arguments,
+                )
+                try:
+                    validate_mcp_arguments(dict(registered.spec.input_schema), arguments)
+                except MCPArgumentLimit:
+                    return ToolResult.error(
+                        "MCP arguments exceeded finite-data or validation-work limits.",
+                        diagnostics={"category": "mcp_argument_limit", "redact_logs": True},
+                    )
+            else:
+                Draft202012Validator(dict(registered.spec.input_schema)).validate(arguments)
         except ValidationError as exc:
+            if registered.redact_logs:
+                return ToolResult.error(
+                    f"Invalid arguments for {call.capability}: arguments do not match the declared schema.",
+                    diagnostics={"category": "mcp_argument_validation", "redact_logs": True},
+                )
             path = ".".join(str(part) for part in exc.absolute_path)
             location = f" at {path}" if path else ""
             reason = self._native_validation_reason(exc)
@@ -211,9 +299,9 @@ class IntegrationRegistry:
             )
 
         try:
-            result = registered.handler(dict(call.arguments), context)
+            result = registered.handler(arguments, context)
         except Exception:
-            logger.exception("Capability %s failed", call.capability)
+            logger.error("Capability %s failed", call.capability, exc_info=not registered.redact_logs)
             return ToolResult.error(
                 f"Capability execution failed: {call.capability}",
                 diagnostics={
@@ -247,7 +335,7 @@ class IntegrationRegistry:
     def collect_context(self, invocation: InvocationContext, max_chars: int) -> str | None:
         remaining = max(0, int(max_chars))
         sections: list[str] = []
-        for name, integration in sorted(self._integrations.items()):
+        for name, integration in sorted(tuple(self._integrations.items())):
             if remaining <= 0:
                 break
             provider = getattr(integration, "context", None)
@@ -279,7 +367,7 @@ class IntegrationRegistry:
         return "\n\n".join(sections) or None
 
     def close(self) -> None:
-        for name, integration in reversed(self._integrations.items()):
+        for name, integration in reversed(tuple(self._integrations.items())):
             close = getattr(integration, "close", None)
             if not callable(close):
                 continue
@@ -318,7 +406,7 @@ class IntegrationRegistry:
             raise ValueError(f"Event {spec.event} has an invalid notification policy")
         if not isinstance(spec.replay_policy, ReplayPolicy):
             raise ValueError(f"Event {spec.event} has an invalid replay policy")
-        self._events[spec.event] = spec
+        self._events = {**self._events, spec.event: spec}
 
     def _validate_event_allowlists(self) -> None:
         for spec in self._events.values():

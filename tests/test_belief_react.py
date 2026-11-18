@@ -25,6 +25,7 @@ from app.integrations.beliefs import BeliefIntegration
 from app.integrations.builtins import MemoryIntegration
 from app.core.tool_executor import ToolExecutor
 from app.storage.database import Database
+from tests.support import buffered_generation
 
 
 NOW = datetime(2026, 8, 27, 10, 0, tzinfo=timezone.utc)
@@ -365,7 +366,14 @@ class ReactBeliefToolTests(unittest.TestCase):
         self.assertFalse(self.repository.has_application("astra", 1, REACT_TOOL_BELIEF_VERSION))
 
     def test_existing_correction_pass_receives_repair_hint_and_applies_complete_batch(self):
+        self._exercise_correction(False)
+
+    def test_reasoning_enabled_preserves_belief_authorization_and_atomic_correction(self):
+        self._exercise_correction(True)
+
+    def _exercise_correction(self, enabled):
         from app.core.response_generator import ResponseGenerator
+        from app.core.execution_state import ExecutionSettings
 
         authoritative = turn()
         context = self.context(authoritative)
@@ -389,9 +397,11 @@ class ReactBeliefToolTests(unittest.TestCase):
 
         llm = SimpleNamespace(
             resolve_think_value=lambda override: True if override is None else override,
-            chat_buffered=chat,
+            chat_buffered_result=lambda **kwargs: buffered_generation(chat(**kwargs)),
+            generation_options=lambda *_args: {"num_ctx": 32768, "num_predict": 2048},
         )
-        generator = ResponseGenerator(llm, ToolExecutor(self.registry), Mock())
+        generator = ResponseGenerator(llm, ToolExecutor(self.registry), Mock(),
+                                      execution_settings=ExecutionSettings(reasoning_enabled=enabled))
         list(generator.stream_late_routed_response(
             authoritative.session_id, [], authoritative.user_text,
             authoritative_turn=authoritative, prepared_belief_turn=context.prepared_belief_turn,

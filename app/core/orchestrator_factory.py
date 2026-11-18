@@ -14,6 +14,9 @@ from app.memory.chat_history import ChatHistoryStore
 from app.memory.memory_store import MemoryStore
 from app.memory.summary_store import SummaryStore
 from app.core.context_builder import ContextBuilder
+from app.core.execution_state import ExecutionProfile, ExecutionProfileOverrides
+from app.core.prompt_budget import PromptBudget
+from app.core.task_workspace import WorkspaceLimits
 from app.memory.history_summarizer import HistorySummarizer
 from app.memory.memory_policy import SimpleMemoryPolicy
 from app.memory.action_handler import MemoryActionHandler
@@ -22,14 +25,20 @@ from app.core.tool_executor import ToolExecutor
 from app.core.turn_finalizer import TurnFinalizer
 from app.integrations import (
     BeliefIntegration,
+    HistoryIntegration,
     IntegrationRegistry,
     MemoryIntegration,
     WebIntegration,
 )
 from app.integrations.builtins import ShellIntegration
+from app.integrations.mcp import MCPIntegration
+from app.integrations.mcp_runtime import MCPRuntime
 from app.tools.bash_execution import BashExecutionTool
+from app.tools.langsearch import LangSearchClient
+from app.tools.web.reader import Crawl4AIReader
+from app.tools.web.service import WebReaderService
+from app.tools.web.sources import SourceCache
 from app.tools.web_search import SearXNGClient, WebSearchTool
-from app.tools.search_summarizer import SearchResultSummarizer
 from app.beliefs import (
     BeliefCandidateExtractor,
     BeliefContextProvider,
@@ -177,6 +186,39 @@ def validate_demo_config(config: Config) -> None:
         raise ValueError("Autonomous event processing is not supported by the demo")
 
 
+def _build_web_integration(config: Config, history: ChatHistoryStore) -> WebIntegration:
+    web = config.integrations["web"]
+    search_settings = {
+        key: web[key]
+        for key in (
+            "timeout", "max_retries", "retry_backoff_s", "total_timeout_s",
+            "max_retry_after_s", "max_response_bytes", "query_max_chars",
+            "title_max_chars", "url_max_chars", "snippet_max_chars",
+        )
+    }
+    if web["provider"] == "langsearch":
+        client = LangSearchClient(api_key_env=web["langsearch_api_key_env"], **search_settings)
+    else:
+        client = SearXNGClient(base_url=web["base_url"], **search_settings)
+    tool = WebSearchTool(client, max_results=web["max_results"], max_output_chars=web["max_output_chars"])
+    sources = SourceCache(**web["cache"], is_session_deleted=history.is_session_deleted)
+
+    reader_config = dict(web["reader"])
+    reader_enabled = reader_config.pop("enabled")
+    service_settings = {
+        key: reader_config.pop(key)
+        for key in ("window_lines", "max_output_chars", "find_max_matches",
+                    "find_context_lines", "find_text_max_chars")
+    }
+    reader = Crawl4AIReader(
+        **reader_config,
+        max_document_bytes=web["cache"]["max_document_bytes"],
+        url_max_chars=web["url_max_chars"],
+    ) if reader_enabled else None
+    service = WebReaderService(sources, reader, **service_settings, url_max_chars=web["url_max_chars"])
+    return WebIntegration(tool, sources, service, page_tools_enabled=reader_enabled)
+
+
 def build_orchestrator(
     config: Config | None = None, *, state_dir: Path | None = None
 ) -> Orchestrator:
@@ -208,6 +250,7 @@ def build_orchestrator(
         vectors = VectorStore(path=str(state_dir / "vectors"))
         resources.callback(vectors.close)
         agent_id = config.assistant["id"]
+        history_config = config.integrations["history"]
         history = ChatHistoryStore(
             db,
             vectors,
@@ -217,6 +260,8 @@ def build_orchestrator(
             local_assistant_id=agent_id,
             local_assistant_name=config.assistant["display_name"],
             episodic_max_distance=config.context["episodic_memory_max_distance"],
+            trusted_session_ids=history_config["trusted_session_ids"],
+            allow_all_sessions=history_config["allow_all_sessions"],
         )
         memory = MemoryStore(
             db,
@@ -242,28 +287,33 @@ def build_orchestrator(
             )
         if beliefs.integration:
             integrations.append(beliefs.integration)
-        web = config.integrations["web"]
-        if web["enabled"]:
-            client = SearXNGClient(
-                base_url=web["base_url"],
-                timeout=web["timeout"],
-                max_retries=web["max_retries"],
-                retry_backoff_s=web["retry_backoff_s"],
-            )
-            integrations.append(
-                WebIntegration(
-                    WebSearchTool(
-                        client=client,
-                        summarizer=SearchResultSummarizer(llm),
-                        max_results=web["max_results"],
-                    )
-                )
-            )
+        if history_config["enabled"]:
+            integrations.append(HistoryIntegration(history))
+        integration_resources = resources.enter_context(ExitStack())
+        web_integration = None
+        if config.integrations["web"]["enabled"]:
+            web_integration = _build_web_integration(config, history)
+            integration_resources.callback(web_integration.close)
+            integrations.append(web_integration)
         shell = config.integrations["shell"]
         if shell["enabled"]:
             integrations.append(ShellIntegration(BashExecutionTool(timeout=shell["timeout"])))
+        mcp_runtime = MCPRuntime(config.integrations["mcp"])
+        integration_resources.callback(mcp_runtime.close)
+        integrations.append(MCPIntegration(mcp_runtime))
         registry = IntegrationRegistry(integrations)
         resources.callback(registry.close)
+        integration_resources.pop_all()
+
+        budget_config = dict(config.context["prompt_budget"])
+        budget_enabled = budget_config.pop("enabled")
+        prompt_budget = PromptBudget(**budget_config) if budget_enabled else None
+        execution_profiles = {}
+        for name, overrides in config.execution["profiles"].items():
+            profile_config = dict(overrides)
+            if profile_config.get("workspace") is not None:
+                profile_config["workspace"] = WorkspaceLimits(**profile_config["workspace"])
+            execution_profiles[ExecutionProfile(name)] = ExecutionProfileOverrides(**profile_config)
         orchestrator = Orchestrator(
             llm=llm,
             context_builder=ContextBuilder(
@@ -309,7 +359,13 @@ def build_orchestrator(
             generation_deadline_s=config.orchestrator["generation_deadline_s"],
             recovery_deadline_s=config.orchestrator["recovery_deadline_s"],
             recovery_num_predict=config.orchestrator["recovery_num_predict"],
+            recovery_observation_chars=config.orchestrator["recovery_observation_chars"],
             max_late_routing_steps=config.autonomy["max_tool_steps"],
+            web_sources=web_integration.sources if web_integration else None,
+            prompt_budget=prompt_budget,
+            execution_profile=config.execution["default_profile"],
+            execution_profiles=execution_profiles,
+            reasoning_enabled=config.reasoning["enabled"],
             database=db,
             vector_store=vectors,
         )

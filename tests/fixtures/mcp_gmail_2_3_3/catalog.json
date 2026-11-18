@@ -1,0 +1,2471 @@
+{
+  "package": "@mcp-z/mcp-gmail",
+  "version": "2.3.3",
+  "protocol": "2026-07-28",
+  "capture": "Actual stdio tools/list with dummy client id, memory token store, isolated cwd; no tools/call",
+  "tools": [
+    {
+      "name": "account-list",
+      "description": "List all linked mcp-gmail accounts with their aliases and active status.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {}
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "service": {
+                    "type": "string"
+                  },
+                  "accounts": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "email": {
+                          "type": "string"
+                        },
+                        "alias": {
+                          "type": "string"
+                        },
+                        "isActive": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "email",
+                        "isActive"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "totalAccounts": {
+                    "type": "number"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "service",
+                  "accounts",
+                  "totalAccounts",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "account-me",
+      "description": "Show current mcp-gmail user identity. Returns email, alias (if set), and session expiry information.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {}
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "service": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "alias": {
+                    "type": "string"
+                  },
+                  "sessionExpiresIn": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "service",
+                  "email",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "account-remove",
+      "description": "Remove mcp-gmail account and delete stored tokens permanently. If removing the active account, the first remaining account becomes active. Requires email or alias parameter.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "accountId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Email address or alias of account to remove"
+          }
+        },
+        "required": [
+          "accountId"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "service": {
+                    "type": "string"
+                  },
+                  "removed": {
+                    "type": "string"
+                  },
+                  "remainingAccounts": {
+                    "type": "number"
+                  },
+                  "newActiveAccount": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "service",
+                  "removed",
+                  "remainingAccounts",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "account-switch",
+      "description": "Use mcp-gmail account (smart mode). If email/alias provided and already linked, switches to it without triggering OAuth. If not linked or no email provided, triggers OAuth browser flow to add account. Returns account email, whether it was newly added, and total account count.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "email": {
+            "description": "Email address to link (if already linked, switches without OAuth)",
+            "type": "string"
+          },
+          "alias": {
+            "description": "Optional alias for easy identification",
+            "type": "string"
+          }
+        }
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "isNew": {
+                    "type": "boolean"
+                  },
+                  "totalAccounts": {
+                    "type": "number"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "email",
+                  "isNew",
+                  "totalAccounts",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "categories-list",
+      "description": "List Gmail category labels (CATEGORY_*) with IDs and descriptions.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {}
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "description": "Gmail category ID (e.g., CATEGORY_PERSONAL)"
+                        },
+                        "name": {
+                          "type": "string",
+                          "description": "Human-readable category name"
+                        },
+                        "description": {
+                          "type": "string",
+                          "description": "Description of what emails belong in this category"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "description"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "type",
+                  "items"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "label-add",
+      "description": "Add a label to a Gmail message",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Gmail message ID to add label to"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Label name or ID (use gmail-labels-list to discover available labels)"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "item": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Message ID the label was added to"
+                      },
+                      "label": {
+                        "type": "string",
+                        "description": "Label that was added"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "label"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "type",
+                  "item"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "label-delete",
+      "description": "Delete Gmail labels permanently (irreversible). System labels (INBOX, SENT, etc.) cannot be deleted.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ids": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Gmail label IDs to delete"
+          }
+        },
+        "required": [
+          "ids"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "totalRequested": {
+                    "type": "number",
+                    "description": "Total number of labels requested to delete"
+                  },
+                  "successCount": {
+                    "type": "number",
+                    "description": "Number of labels successfully deleted"
+                  },
+                  "failureCount": {
+                    "type": "number",
+                    "description": "Number of labels that failed to delete"
+                  },
+                  "results": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "description": "Label ID"
+                        },
+                        "success": {
+                          "type": "boolean",
+                          "description": "Whether the operation succeeded"
+                        },
+                        "error": {
+                          "description": "Error message if operation failed",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "success"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Individual results for each label"
+                  }
+                },
+                "required": [
+                  "type",
+                  "totalRequested",
+                  "successCount",
+                  "failureCount",
+                  "results"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "labels-list",
+      "description": "List Gmail labels for label: query syntax. Case-sensitive.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {}
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "description": "Gmail label ID"
+                        },
+                        "name": {
+                          "type": "string",
+                          "description": "Label name for use in queries (case-sensitive)"
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "user",
+                            "system"
+                          ],
+                          "description": "Whether this is a user-created or system label"
+                        },
+                        "visibility": {
+                          "type": "string",
+                          "enum": [
+                            "labelShow",
+                            "labelHide",
+                            "labelShowIfUnread"
+                          ],
+                          "description": "Label visibility in Gmail UI"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "type",
+                        "visibility"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "type",
+                  "items"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "message-get",
+      "description": "Get a Gmail message by ID with flexible field selection",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Gmail message ID to retrieve"
+          },
+          "fields": {
+            "description": "Comma-separated fields to return. Omit for all fields. Available: id, threadId, subject, from, fromName, to, cc, bcc, date, snippet, body, isRead, isImportant, hasAttachments, attachmentCount, labelIds, folderName",
+            "type": "string"
+          },
+          "contentType": {
+            "default": "text",
+            "description": "Format for body content: text extracts plain text, html preserves HTML structure",
+            "type": "string",
+            "enum": [
+              "text",
+              "html"
+            ]
+          },
+          "excludeThreadHistory": {
+            "default": false,
+            "description": "When true, removes quoted thread history from body content",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "item": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "threadId": {
+                        "description": "Thread/conversation ID for grouping related messages",
+                        "type": "string"
+                      },
+                      "subject": {
+                        "type": "string"
+                      },
+                      "from": {
+                        "type": "string"
+                      },
+                      "fromName": {
+                        "type": "string"
+                      },
+                      "to": {
+                        "type": "string"
+                      },
+                      "cc": {
+                        "type": "string"
+                      },
+                      "bcc": {
+                        "type": "string"
+                      },
+                      "date": {
+                        "description": "Date in RFC 2822 format",
+                        "type": "string"
+                      },
+                      "receivedDateTime": {
+                        "description": "ISO datetime when message was received",
+                        "type": "string"
+                      },
+                      "snippet": {
+                        "description": "Short preview of the message body",
+                        "type": "string"
+                      },
+                      "isRead": {
+                        "description": "Whether the message has been read",
+                        "type": "boolean"
+                      },
+                      "isImportant": {
+                        "description": "Whether the message is marked as important/priority",
+                        "type": "boolean"
+                      },
+                      "hasAttachments": {
+                        "description": "Whether the message has file attachments",
+                        "type": "boolean"
+                      },
+                      "attachmentCount": {
+                        "description": "Number of attachments",
+                        "type": "number"
+                      },
+                      "labelIds": {
+                        "description": "Gmail label IDs or Outlook category IDs",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "folderName": {
+                        "description": "Name of the folder/mailbox containing this message",
+                        "type": "string"
+                      },
+                      "body": {
+                        "type": "string"
+                      },
+                      "bodyContentType": {
+                        "type": "string",
+                        "enum": [
+                          "text",
+                          "html"
+                        ]
+                      },
+                      "attachments": {
+                        "description": "Detailed attachment information",
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "filename": {
+                              "type": "string"
+                            },
+                            "mimeType": {
+                              "type": "string"
+                            },
+                            "size": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "filename",
+                            "mimeType"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "type",
+                  "item"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "message-mark-read",
+      "description": "Mark a Gmail message as read",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Gmail message ID to mark as read"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "id": {
+                    "type": "string",
+                    "description": "Message ID that was marked as read"
+                  }
+                },
+                "required": [
+                  "type",
+                  "id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "message-move-to-trash",
+      "description": "Move Gmail messages to trash (recoverable).",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "ids": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Gmail message IDs to move to trash"
+          }
+        },
+        "required": [
+          "ids"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "totalRequested": {
+                    "type": "number",
+                    "description": "Total number of messages requested to trash"
+                  },
+                  "successCount": {
+                    "type": "number",
+                    "description": "Number of messages successfully moved to trash"
+                  },
+                  "failureCount": {
+                    "type": "number",
+                    "description": "Number of messages that failed to move"
+                  },
+                  "results": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "description": "Message ID"
+                        },
+                        "success": {
+                          "type": "boolean",
+                          "description": "Whether the operation succeeded"
+                        },
+                        "error": {
+                          "description": "Error message if operation failed",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "success"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Individual results for each message"
+                  }
+                },
+                "required": [
+                  "type",
+                  "totalRequested",
+                  "successCount",
+                  "failureCount",
+                  "results"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "message-respond",
+      "description": "Send a reply to a Gmail message",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Gmail message ID to reply to"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Reply body content (plain text or HTML)"
+          },
+          "contentType": {
+            "default": "text",
+            "description": "Format of the body content",
+            "type": "string",
+            "enum": [
+              "text",
+              "html"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "body"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "id": {
+                    "type": "string",
+                    "description": "Original message ID that was replied to"
+                  }
+                },
+                "required": [
+                  "type",
+                  "id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "message-search",
+      "description": "Search Gmail messages using structured query objects with flexible field selection.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "query": {
+            "description": "Structured query object or JSON string for filtering messages. Use query-syntax prompt for reference and rawGmailQuery for Gmail syntax.",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/__schema0"
+              },
+              {
+                "type": "string",
+                "minLength": 1
+              }
+            ]
+          },
+          "fields": {
+            "description": "Comma-separated fields to return. Omit for all fields. Available: id, threadId, subject, from, fromName, to, cc, bcc, date, snippet, body, isRead, isImportant, hasAttachments, attachmentCount, labelIds, folderName",
+            "type": "string"
+          },
+          "pageSize": {
+            "default": 50,
+            "description": "Number of items per page (default: 50, max: 1000). Accepts numbers or numeric strings.",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 1000
+          },
+          "pageToken": {
+            "description": "Token for retrieving the next page of results (gmail format). Omit for first page.",
+            "type": "string",
+            "minLength": 1
+          },
+          "shape": {
+            "default": "objects",
+            "description": "Response shape: objects (keyed) or arrays (columnar, matching fields order)",
+            "type": "string",
+            "enum": [
+              "objects",
+              "arrays"
+            ]
+          },
+          "contentType": {
+            "default": "text",
+            "description": "Format for body content: text extracts plain text, html preserves HTML structure",
+            "type": "string",
+            "enum": [
+              "text",
+              "html"
+            ]
+          },
+          "excludeThreadHistory": {
+            "default": false,
+            "description": "When true, removes quoted thread history from body content",
+            "type": "boolean"
+          }
+        },
+        "$defs": {
+          "__schema0": {
+            "type": "object",
+            "properties": {
+              "$and": {
+                "description": "Array of conditions that must ALL match",
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/__schema0"
+                }
+              },
+              "$or": {
+                "description": "Array of conditions where ANY must match",
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/__schema0"
+                }
+              },
+              "$not": {
+                "description": "Nested condition that must NOT match",
+                "$ref": "#/$defs/__schema0"
+              },
+              "from": {
+                "description": "Filter by sender email address or name (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "to": {
+                "description": "Filter by recipient email address (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "cc": {
+                "description": "Filter by CC recipient email address (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "bcc": {
+                "description": "Filter by BCC recipient email address (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "subject": {
+                "description": "Filter by subject line (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "body": {
+                "description": "Filter by email body content (partial match)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "text": {
+                "description": "Search in both subject AND body (convenience shortcut)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "hasAttachment": {
+                "description": "Filter messages with file attachments",
+                "type": "boolean"
+              },
+              "isRead": {
+                "description": "Filter by read status (true = read, false = unread)",
+                "type": "boolean"
+              },
+              "date": {
+                "description": "Filter by date range",
+                "type": "object",
+                "properties": {
+                  "$gte": {
+                    "description": "Messages on or after this date (YYYY-MM-DD)",
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  },
+                  "$lt": {
+                    "description": "Messages before this date (YYYY-MM-DD)",
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "fuzzyPhrase": {
+                "description": "Fuzzy phrase matching - words should appear together (approximate matching). Gmail uses relevance-based matching.",
+                "type": "string",
+                "minLength": 1
+              },
+              "categories": {
+                "description": "Filter by Gmail system categories (primary, social, promotions, updates, forums)",
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "primary",
+                      "social",
+                      "promotions",
+                      "updates",
+                      "forums"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "primary",
+                            "social",
+                            "promotions",
+                            "updates",
+                            "forums"
+                          ]
+                        }
+                      },
+                      "$all": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "primary",
+                            "social",
+                            "promotions",
+                            "updates",
+                            "forums"
+                          ]
+                        }
+                      },
+                      "$none": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "primary",
+                            "social",
+                            "promotions",
+                            "updates",
+                            "forums"
+                          ]
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "label": {
+                "description": "Filter by user-created labels (case-sensitive). Use gmail-labels-list to see available labels",
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "rawGmailQuery": {
+                "description": "Raw Gmail query syntax for advanced use cases. Bypasses schema validation - use sparingly.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "shape": {
+                    "type": "string",
+                    "const": "objects"
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "threadId": {
+                          "description": "Thread/conversation ID for grouping related messages",
+                          "type": "string"
+                        },
+                        "subject": {
+                          "type": "string"
+                        },
+                        "from": {
+                          "type": "string"
+                        },
+                        "fromName": {
+                          "type": "string"
+                        },
+                        "to": {
+                          "type": "string"
+                        },
+                        "cc": {
+                          "type": "string"
+                        },
+                        "bcc": {
+                          "type": "string"
+                        },
+                        "date": {
+                          "description": "Date in RFC 2822 format",
+                          "type": "string"
+                        },
+                        "receivedDateTime": {
+                          "description": "ISO datetime when message was received",
+                          "type": "string"
+                        },
+                        "snippet": {
+                          "description": "Short preview of the message body",
+                          "type": "string"
+                        },
+                        "isRead": {
+                          "description": "Whether the message has been read",
+                          "type": "boolean"
+                        },
+                        "isImportant": {
+                          "description": "Whether the message is marked as important/priority",
+                          "type": "boolean"
+                        },
+                        "hasAttachments": {
+                          "description": "Whether the message has file attachments",
+                          "type": "boolean"
+                        },
+                        "attachmentCount": {
+                          "description": "Number of attachments",
+                          "type": "number"
+                        },
+                        "labelIds": {
+                          "description": "Gmail label IDs or Outlook category IDs",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "folderName": {
+                          "description": "Name of the folder/mailbox containing this message",
+                          "type": "string"
+                        },
+                        "body": {
+                          "type": "string"
+                        },
+                        "bodyContentType": {
+                          "type": "string",
+                          "enum": [
+                            "text",
+                            "html"
+                          ]
+                        },
+                        "attachments": {
+                          "description": "Detailed attachment information",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "filename": {
+                                "type": "string"
+                              },
+                              "mimeType": {
+                                "type": "string"
+                              },
+                              "size": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "id",
+                              "filename",
+                              "mimeType"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "description": "Matching email messages"
+                  },
+                  "nextPageToken": {
+                    "description": "Token for fetching next page of results",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "shape",
+                  "items"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "shape": {
+                    "type": "string",
+                    "const": "arrays"
+                  },
+                  "columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Column names in canonical order"
+                  },
+                  "rows": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "items": {}
+                    },
+                    "description": "Row data matching column order"
+                  },
+                  "nextPageToken": {
+                    "description": "Token for fetching next page of results",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "shape",
+                  "columns",
+                  "rows"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "message-send",
+      "description": "Send an email message through Gmail",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "to": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Recipient email address(es). For multiple recipients, use comma-separated: \"alice@example.com, bob@example.com\""
+          },
+          "cc": {
+            "description": "CC recipients. For multiple recipients, use comma-separated: \"alice@example.com, bob@example.com\" (optional)",
+            "type": "string",
+            "minLength": 1
+          },
+          "bcc": {
+            "description": "BCC recipients (hidden copy). For multiple recipients, use comma-separated: \"alice@example.com, bob@example.com\" (optional)",
+            "type": "string",
+            "minLength": 1
+          },
+          "subject": {
+            "default": "",
+            "type": "string",
+            "description": "Message subject"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Email body content (plain text or HTML)"
+          },
+          "contentType": {
+            "default": "text",
+            "description": "Format of the body content",
+            "type": "string",
+            "enum": [
+              "text",
+              "html"
+            ]
+          }
+        },
+        "required": [
+          "to",
+          "body"
+        ]
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "item": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Unique ID of the sent message"
+                      },
+                      "threadId": {
+                        "description": "Thread/conversation ID if applicable",
+                        "type": "string"
+                      },
+                      "sentAt": {
+                        "type": "string",
+                        "description": "When the message was sent (ISO datetime)"
+                      },
+                      "recipientCount": {
+                        "type": "number",
+                        "description": "Total number of recipients (to + cc + bcc)"
+                      },
+                      "webLink": {
+                        "description": "Link to view the sent message in Gmail",
+                        "type": "string"
+                      },
+                      "size": {
+                        "description": "Message size in bytes",
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "sentAt",
+                      "recipientCount"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "type",
+                  "item"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "messages-export-csv",
+      "description": "Export Gmail messages to CSV with streaming pagination. Returns file URI. Use query-syntax prompt for query reference.",
+      "input_schema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "query": {
+            "description": "Structured query object or JSON string for filtering messages. Use query-syntax prompt for reference and rawGmailQuery for Gmail syntax.",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/__schema0"
+              },
+              {
+                "type": "string",
+                "minLength": 1
+              }
+            ]
+          },
+          "maxItems": {
+            "default": 10000,
+            "description": "Maximum messages to export (default: 10000, max: 50000)",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 50000
+          },
+          "filename": {
+            "default": "gmail-messages.csv",
+            "description": "Output filename (default: gmail-messages.csv)",
+            "type": "string",
+            "minLength": 1
+          },
+          "contentType": {
+            "default": "text",
+            "description": "Format for body content: text extracts plain text, html preserves HTML structure",
+            "type": "string",
+            "enum": [
+              "text",
+              "html"
+            ]
+          },
+          "excludeThreadHistory": {
+            "default": false,
+            "description": "When true, removes quoted thread history from body content",
+            "type": "boolean"
+          }
+        },
+        "$defs": {
+          "__schema0": {
+            "type": "object",
+            "properties": {
+              "$and": {
+                "description": "Array of conditions that must ALL match",
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/__schema0"
+                }
+              },
+              "$or": {
+                "description": "Array of conditions where ANY must match",
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/__schema0"
+                }
+              },
+              "$not": {
+                "description": "Nested condition that must NOT match",
+                "$ref": "#/$defs/__schema0"
+              },
+              "from": {
+                "description": "Filter by sender email address or name (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "to": {
+                "description": "Filter by recipient email address (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "cc": {
+                "description": "Filter by CC recipient email address (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "bcc": {
+                "description": "Filter by BCC recipient email address (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "subject": {
+                "description": "Filter by subject line (partial match, case-insensitive)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "body": {
+                "description": "Filter by email body content (partial match)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "text": {
+                "description": "Search in both subject AND body (convenience shortcut)",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "hasAttachment": {
+                "description": "Filter messages with file attachments",
+                "type": "boolean"
+              },
+              "isRead": {
+                "description": "Filter by read status (true = read, false = unread)",
+                "type": "boolean"
+              },
+              "date": {
+                "description": "Filter by date range",
+                "type": "object",
+                "properties": {
+                  "$gte": {
+                    "description": "Messages on or after this date (YYYY-MM-DD)",
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  },
+                  "$lt": {
+                    "description": "Messages before this date (YYYY-MM-DD)",
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "fuzzyPhrase": {
+                "description": "Fuzzy phrase matching - words should appear together (approximate matching). Gmail uses relevance-based matching.",
+                "type": "string",
+                "minLength": 1
+              },
+              "categories": {
+                "description": "Filter by Gmail system categories (primary, social, promotions, updates, forums)",
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "primary",
+                      "social",
+                      "promotions",
+                      "updates",
+                      "forums"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "primary",
+                            "social",
+                            "promotions",
+                            "updates",
+                            "forums"
+                          ]
+                        }
+                      },
+                      "$all": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "primary",
+                            "social",
+                            "promotions",
+                            "updates",
+                            "forums"
+                          ]
+                        }
+                      },
+                      "$none": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "primary",
+                            "social",
+                            "promotions",
+                            "updates",
+                            "forums"
+                          ]
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "label": {
+                "description": "Filter by user-created labels (case-sensitive). Use gmail-labels-list to see available labels",
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "$any": {
+                        "description": "OR within field - matches if ANY value matches",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$all": {
+                        "description": "AND within field - matches if ALL values match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "$none": {
+                        "description": "NOT within field - matches if NONE match",
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "rawGmailQuery": {
+                "description": "Raw Gmail query syntax for advanced use cases. Bypasses schema validation - use sparingly.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "result": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "success"
+                  },
+                  "uri": {
+                    "type": "string",
+                    "description": "File URI (file:// or http://)"
+                  },
+                  "filename": {
+                    "type": "string",
+                    "description": "Stored filename"
+                  },
+                  "rowCount": {
+                    "type": "number",
+                    "description": "Number of messages exported"
+                  },
+                  "truncated": {
+                    "type": "boolean",
+                    "description": "Whether export was truncated at maxItems"
+                  }
+                },
+                "required": [
+                  "type",
+                  "uri",
+                  "filename",
+                  "rowCount",
+                  "truncated"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "auth_required"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "provider",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "dependencies": {
+    "@mcp-z/server": "2.2.5",
+    "@mcp-z/email": "1.1.4",
+    "@mcp-z/oauth": "2.1.3",
+    "@mcp-z/oauth-google": "2.3.1",
+    "zod": "4.6.7"
+  },
+  "installed_lock_sha256": "1e817a94d792f81090de0375501971aeaa36ac8c37d6da56ea486ac017dbc488",
+  "node_version": "v24.22.2"
+}

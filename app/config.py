@@ -412,13 +412,89 @@ class _EnabledIntegrationConfig(_StrictConfigModel):
     enabled: bool
 
 
+class _WebCacheConfig(_StrictConfigModel):
+    ttl_s: float = Field(default=600.0, gt=0, le=3600)
+    max_document_bytes: int = Field(default=524288, ge=1024, le=1048576)
+    max_session_bytes: int = Field(default=4194304, ge=262144, le=16777216)
+    max_total_bytes: int = Field(default=16777216, ge=262144, le=67108864)
+    max_session_entries: int = Field(default=64, ge=50, le=256)
+    max_total_entries: int = Field(default=256, ge=50, le=1024)
+    max_document_lines: int = Field(default=10000, ge=1, le=20000)
+
+    @model_validator(mode="after")
+    def validate_limits(self):
+        if not self.max_document_bytes <= self.max_session_bytes <= self.max_total_bytes:
+            raise ValueError("web cache requires document bytes <= session bytes <= total bytes")
+        if self.max_session_entries > self.max_total_entries:
+            raise ValueError("web cache requires session entries <= total entries")
+        return self
+
+
+class _WebReaderConfig(_StrictConfigModel):
+    enabled: bool = False
+    python_executable: str | None = None
+    browsers_path: str | None = None
+    total_timeout_s: float = Field(default=30.0, gt=0, le=60)
+    max_response_bytes: int = Field(default=2097152, ge=1024, le=8388608)
+    max_total_bytes: int = Field(default=4194304, ge=1024, le=16777216)
+    max_requests: int = Field(default=32, ge=1, le=64)
+    max_redirects: int = Field(default=3, ge=0, le=5)
+    max_links: int = Field(default=20, ge=0, le=30)
+    max_memory_mb: int = Field(default=1536, ge=512, le=4096)
+    max_cpu_percent: int = Field(default=100, ge=10, le=400)
+    max_tasks: int = Field(default=256, ge=64, le=512)
+    window_lines: int = Field(default=40, ge=1, le=100)
+    max_output_chars: int = Field(default=8000, ge=1024, le=16000)
+    find_max_matches: int = Field(default=5, ge=1, le=10)
+    find_context_lines: int = Field(default=3, ge=0, le=5)
+    find_text_max_chars: int = Field(default=200, ge=1, le=500)
+
+    @field_validator("python_executable", "browsers_path")
+    @classmethod
+    def validate_path(cls, value):
+        if value is not None and not Path(value).is_absolute():
+            raise ValueError("web reader paths must be absolute")
+        return value
+
+    @model_validator(mode="after")
+    def validate_limits(self):
+        if self.max_response_bytes > self.max_total_bytes:
+            raise ValueError("web reader requires response bytes <= total bytes")
+        return self
+
+
 class _WebIntegrationConfig(_EnabledIntegrationConfig):
     enabled: bool = False
+    provider: Literal["searxng", "langsearch"] = "searxng"
+    langsearch_api_key_env: str = "LANGSEARCH_API_KEY"
     base_url: str = "http://localhost:8080"
     timeout: float = Field(default=10.0, gt=0.0, le=300.0)
     max_retries: int = Field(default=2, ge=0, le=20)
     retry_backoff_s: float = Field(default=0.25, ge=0.0, le=60.0)
     max_results: int = Field(default=5, gt=0, le=50)
+    total_timeout_s: float = Field(default=15.0, gt=0.0, le=300.0)
+    max_retry_after_s: float = Field(default=2.0, ge=0.0, le=30.0)
+    max_response_bytes: int = Field(default=1048576, ge=1024, le=8388608)
+    query_max_chars: int = Field(default=512, ge=1, le=2000)
+    title_max_chars: int = Field(default=240, ge=1, le=1000)
+    url_max_chars: int = Field(default=2048, ge=128, le=4096)
+    snippet_max_chars: int = Field(default=1000, ge=1, le=4000)
+    max_output_chars: int = Field(default=8000, ge=1024, le=32000)
+    cache: _WebCacheConfig = Field(default_factory=_WebCacheConfig)
+    reader: _WebReaderConfig = Field(default_factory=_WebReaderConfig)
+
+    @field_validator("langsearch_api_key_env")
+    @classmethod
+    def validate_api_key_env(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", value):
+            raise ValueError("integrations.web.langsearch_api_key_env must be an environment variable name")
+        return value
+
+    @model_validator(mode="after")
+    def validate_output_budget(self):
+        if self.max_output_chars < self.query_max_chars + 512:
+            raise ValueError("web.max_output_chars must reserve at least query_max_chars + 512 characters for metadata")
+        return self
 
     @field_validator("base_url")
     @classmethod
@@ -442,6 +518,21 @@ class _WebIntegrationConfig(_EnabledIntegrationConfig):
 
 class _MemoryIntegrationConfig(_EnabledIntegrationConfig):
     enabled: bool = True
+
+
+class _HistoryIntegrationConfig(_EnabledIntegrationConfig):
+    enabled: bool = True
+    allow_all_sessions: bool = False
+    trusted_session_ids: list[str] = Field(default_factory=list, max_length=256)
+
+    @field_validator("trusted_session_ids")
+    @classmethod
+    def validate_trusted_session_ids(cls, value: list[str]) -> list[str]:
+        for session_id in value:
+            validate_session_id(session_id)
+        if len(value) != len(set(value)):
+            raise ValueError("trusted_session_ids must not contain duplicates")
+        return value
 
 
 class _ScratchpadIntegrationConfig(_EnabledIntegrationConfig):
@@ -556,10 +647,141 @@ class _MindcraftIntegrationConfig(_EnabledIntegrationConfig):
         return self
 
 
+class MCPServerConfig(_StrictConfigModel):
+    """Local configuration only; environment mappings contain variable names."""
+
+    enabled: bool = False
+    description: str = Field(default="", max_length=512)
+    transport: Literal["stdio", "streamable_http"]
+    command: str | None = Field(default=None, min_length=1, max_length=1024)
+    args: list[str] = Field(default_factory=list, max_length=128)
+    cwd: str | None = None
+    env: dict[str, str] = Field(default_factory=dict, max_length=32)
+    url: str | None = Field(default=None, max_length=2048)
+    headers: dict[str, str] = Field(default_factory=dict, max_length=32)
+    enabled_tools: list[str] = Field(default_factory=list, max_length=256)
+    tool_fingerprints: dict[str, str] = Field(default_factory=dict, max_length=256)
+    tool_approvals: dict[str, bool] = Field(default_factory=dict, max_length=256)
+    approval_required: bool = True
+    connect_timeout_s: float = Field(default=5.0, gt=0, le=120, allow_inf_nan=False)
+    catalog_timeout_s: float = Field(default=15.0, gt=0, le=120, allow_inf_nan=False)
+    shutdown_timeout_s: float = Field(default=5.0, gt=0, le=30, allow_inf_nan=False)
+    max_catalog_pages: int = Field(default=32, gt=0, le=128)
+    max_catalog_tools: int = Field(default=256, gt=0, le=2048)
+    max_catalog_bytes: int = Field(default=1048576, ge=1024, le=8388608)
+    call_timeout_s: float = Field(default=30.0, gt=0, le=300, allow_inf_nan=False)
+    max_message_bytes: int = Field(default=1048576, ge=1024, le=8388608)
+    max_schema_bytes: int = Field(default=65536, ge=1024, le=262144)
+    max_argument_bytes: int = Field(default=16384, ge=512, le=65536)
+    max_result_chars: int = Field(default=16384, ge=2048, le=131072)
+
+    @field_validator("command", "cwd", "url")
+    @classmethod
+    def validate_transport_text(cls, value):
+        if value is not None and (
+            not value or value != value.strip() or any(ord(char) < 32 for char in value)
+        ):
+            raise ValueError("MCP transport values must be nonempty and contain no control characters")
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def validate_args(cls, value):
+        if any(len(arg) > 8192 or "\x00" in arg for arg in value):
+            raise ValueError("MCP arguments must be bounded and contain no NUL characters")
+        return value
+
+    @field_validator("env", "headers")
+    @classmethod
+    def validate_environment_references(cls, value, info):
+        env_name = r"[A-Za-z_][A-Za-z0-9_]*"
+        for key, reference in value.items():
+            if not re.fullmatch(env_name, reference) or len(reference) > 128:
+                raise ValueError("MCP secrets must reference environment variable names")
+            if info.field_name == "env":
+                if not re.fullmatch(env_name, key) or len(key) > 128:
+                    raise ValueError("Invalid MCP child environment variable name")
+            elif (
+                not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", key)
+                or key.lower() in {"host", "content-length", "content-type", "connection", "transfer-encoding"}
+                or key.lower().startswith("mcp-")
+            ):
+                raise ValueError("Invalid or transport-owned MCP header name")
+        if info.field_name == "headers" and len({key.lower() for key in value}) != len(value):
+            raise ValueError("Duplicate MCP header names")
+        return value
+
+    @field_validator("enabled_tools")
+    @classmethod
+    def validate_enabled_tools(cls, value):
+        if len(value) != len(set(value)) or any(
+            not name or len(name) > 128 or "*" in name
+            or any(char.isspace() or ord(char) < 32 for char in name) for name in value
+        ):
+            raise ValueError("MCP enabled tools must be unique exact tool names, without wildcards")
+        return value
+
+    @field_validator("tool_fingerprints")
+    @classmethod
+    def validate_tool_fingerprints(cls, value):
+        cls.validate_enabled_tools(list(value))
+        if any(not re.fullmatch(r"[0-9a-f]{64}", fingerprint) for fingerprint in value.values()):
+            raise ValueError("MCP tool fingerprints must be lowercase SHA-256 values")
+        return value
+
+    @field_validator("tool_approvals")
+    @classmethod
+    def validate_tool_approvals(cls, value):
+        cls.validate_enabled_tools(list(value))
+        return value
+
+    @model_validator(mode="after")
+    def validate_transport(self):
+        if not set(self.tool_fingerprints) <= set(self.enabled_tools):
+            raise ValueError("MCP tool fingerprints must refer to explicitly enabled tools")
+        if self.transport == "stdio":
+            if not self.command or self.url is not None or self.headers:
+                raise ValueError("MCP stdio requires command and forbids HTTP settings")
+            if self.cwd is not None and not Path(self.cwd).is_absolute():
+                raise ValueError("MCP working directory must be absolute")
+        else:
+            if self.command is not None or self.args or self.cwd is not None or self.env:
+                raise ValueError("MCP HTTP forbids subprocess settings")
+            try:
+                parsed = urlsplit(self.url or "")
+                port = parsed.port
+                invalid = (
+                    parsed.scheme not in {"http", "https"} or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.query or parsed.fragment or port == 0
+                    or any(char.isspace() for char in self.url or "")
+                )
+            except ValueError:
+                invalid = True
+            if invalid:
+                raise ValueError("MCP requires an HTTP(S) URL without credentials, query, or fragment")
+        return self
+
+
+class MCPConfig(_StrictConfigModel):
+    enabled: bool = False
+    servers: dict[str, MCPServerConfig] = Field(default_factory=dict, max_length=32)
+    queue_timeout_s: float = Field(default=5.0, gt=0, le=120, allow_inf_nan=False)
+
+    @field_validator("servers")
+    @classmethod
+    def validate_server_ids(cls, value):
+        if any(not re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*", key) or len(key) > 48 for key in value):
+            raise ValueError("MCP server IDs must be bounded lowercase identifiers")
+        return value
+
+
 class _IntegrationsConfig(_StrictConfigModel):
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
     web: _WebIntegrationConfig = Field(default_factory=_WebIntegrationConfig)
     memory: _MemoryIntegrationConfig = Field(default_factory=_MemoryIntegrationConfig)
     scratchpad: _ScratchpadIntegrationConfig = Field(default_factory=_ScratchpadIntegrationConfig)
+    history: _HistoryIntegrationConfig = Field(default_factory=_HistoryIntegrationConfig)
     shell: _ShellIntegrationConfig = Field(default_factory=_ShellIntegrationConfig)
     mindcraft: _MindcraftIntegrationConfig = Field(
         default_factory=_MindcraftIntegrationConfig
@@ -573,6 +795,70 @@ class _OrchestratorConfig(_StrictConfigModel):
     generation_deadline_s: float = Field(default=600.0, gt=0)
     recovery_deadline_s: float = Field(default=180.0, gt=0)
     recovery_num_predict: int = Field(default=192, gt=0)
+    recovery_observation_chars: int = Field(default=1200, gt=0)
+
+
+class _WorkspaceConfig(_StrictConfigModel):
+    max_bytes: int = Field(default=8192, ge=1024)
+    max_text_chars: int = Field(default=512, gt=0)
+    max_items: int = Field(default=8, gt=0)
+    max_observations: int = Field(default=8, gt=0)
+    observation_chars: int = Field(default=192, gt=0)
+    goal_chars: int = Field(default=512, gt=0)
+
+
+class _ExecutionProfileConfig(_StrictConfigModel):
+    # Missing overrides preserve the existing llm/orchestrator/autonomy settings.
+    max_inference_steps: int | None = Field(default=None, gt=0)
+    generation_deadline_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    recovery_deadline_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    recovery_num_predict: int | None = Field(default=None, gt=0)
+    recovery_observation_chars: int | None = Field(default=None, gt=0)
+    correction_num_predict: int | None = Field(default=None, gt=0)
+    context_window_tokens: int | None = Field(default=None, ge=1024, le=262144)
+    num_predict: int | None = Field(default=None, gt=0)
+
+    max_continuations: int | None = Field(default=None, ge=0)
+    max_continuation_attempts: int | None = Field(default=None, gt=0)
+    max_tool_dispatches: int | None = Field(default=None, gt=0)
+    workspace: _WorkspaceConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_context(self):
+        if (self.context_window_tokens is not None and self.num_predict is not None
+                and self.num_predict >= self.context_window_tokens):
+            raise ValueError("num_predict must leave input space in context_window_tokens")
+        return self
+
+
+class _ExecutionProfilesConfig(_StrictConfigModel):
+    standard: _ExecutionProfileConfig = Field(default_factory=_ExecutionProfileConfig)
+    deep: _ExecutionProfileConfig = Field(default_factory=_ExecutionProfileConfig)
+
+
+class _ExecutionConfig(_StrictConfigModel):
+    default_profile: Literal["standard", "deep"] = "standard"
+    profiles: _ExecutionProfilesConfig = Field(default_factory=_ExecutionProfilesConfig)
+
+
+class _ReasoningConfig(_StrictConfigModel):
+    # Additional runtime reasoning steps; independent of llm.thinking.
+    enabled: bool = False
+
+
+class _PromptBudgetConfig(_StrictConfigModel):
+    enabled: bool = False
+    context_window_tokens: int = Field(default=32768, ge=1024, le=262144)
+    completion_reserve_tokens: int = Field(default=2048, ge=1, le=32768)
+    safety_margin_tokens: int = Field(default=1024, ge=128, le=8192)
+    media_reserve_tokens: int = Field(default=8192, ge=1024, le=65536)
+    text_bytes_per_token: float = Field(default=1.0, ge=1.0, le=4.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_reserves(self):
+        if self.completion_reserve_tokens + self.safety_margin_tokens >= self.context_window_tokens:
+            raise ValueError("prompt budget reserves must leave positive input space")
+        return self
 
 
 class _ContextConfig(_StrictConfigModel):
@@ -584,6 +870,7 @@ class _ContextConfig(_StrictConfigModel):
     episodic_memory_max_distance: float = Field(default=0.70, ge=0.0, le=2.0)
     integration_context_limit: int = Field(default=4000, gt=0)
     image_summary_timeout_s: float = Field(default=15.0, gt=0.0, le=120.0)
+    prompt_budget: _PromptBudgetConfig = Field(default_factory=_PromptBudgetConfig)
 
     @model_validator(mode="after")
     def validate_semantic_memory_fallback(self):
@@ -668,11 +955,22 @@ class _RuntimeConfigSections(_StrictConfigModel):
     telemetry: _TelemetryConfig
     integrations: _IntegrationsConfig
     orchestrator: _OrchestratorConfig
+    execution: _ExecutionConfig
+    reasoning: _ReasoningConfig
     context: _ContextConfig
     beliefs: _BeliefsConfig
     autonomy: _AutonomyConfig
     voice_input: _VoiceInputConfig
     vision_watchdog: _VisionWatchdogConfig
+
+    @model_validator(mode="after")
+    def validate_page_reader_activation(self):
+        if self.integrations.web.reader.enabled:
+            if not self.integrations.web.enabled or not self.context.prompt_budget.enabled:
+                raise ValueError("web reader activation requires integrations.web.enabled and context.prompt_budget.enabled")
+            if self.llm.generation.num_ctx is None:
+                raise ValueError("web reader activation requires an explicit llm.generation.num_ctx validated for this model")
+        return self
 
 
 def _format_config_error(exc: ValidationError) -> ValueError:

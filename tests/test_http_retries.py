@@ -3,10 +3,12 @@ import time
 from unittest.mock import Mock, patch
 
 import requests
+import httpx
 
 from app.llm.base import InferenceFailure
 from app.llm.ollama_stream import OllamaClient
 from app.tools.web_search import SearXNGClient
+from app.tools.web.contracts import WebSearchError
 from tests.support import make_response
 
 
@@ -505,56 +507,56 @@ class HttpRetryTests(unittest.TestCase):
         self.assertEqual(last_messages[0]["content"], "again")
         self.assertEqual(last_messages[0]["images"], ["d29ybGQ="])
 
-    @patch("app.tools.web_search.time.sleep", return_value=None)
-    @patch("app.tools.web_search.requests.get")
-    def test_web_search_retries_on_connection_error_then_succeeds(
-        self, get_mock, _sleep_mock
-    ):
-        get_mock.side_effect = [
-            requests.ConnectionError("conn"),
-            make_response(
-                data={
-                    "results": [
-                        {
-                            "title": "T",
-                            "url": "https://example.com",
-                            "content": "C",
-                        }
-                    ]
-                }
-            ),
-        ]
+    def test_web_search_retries_on_connection_error_then_succeeds(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request)
+            if len(calls) == 1:
+                raise httpx.ConnectError("conn")
+            return httpx.Response(200, json={
+                "results": [{
+                    "title": "T",
+                    "url": "https://example.com",
+                    "content": "C",
+                }],
+            })
 
         client = SearXNGClient(
             base_url="http://localhost:8080",
             timeout=0.1,
             max_retries=2,
             retry_backoff_s=0.0,
+            transport=httpx.MockTransport(handle),
         )
+        self.addCleanup(client.close)
         results = client.search("query", limit=5)
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].title, "T")
-        self.assertEqual(get_mock.call_count, 2)
+        self.assertEqual(len(results.results), 1)
+        self.assertEqual(results.results[0].title, "T")
+        self.assertEqual(len(calls), 2)
 
-    @patch("app.tools.web_search.time.sleep", return_value=None)
-    @patch("app.tools.web_search.requests.get")
-    def test_web_search_does_not_retry_on_http_400(self, get_mock, _sleep_mock):
-        response = requests.Response()
-        response.status_code = 400
-        get_mock.side_effect = requests.HTTPError(response=response)
+    def test_web_search_does_not_retry_on_http_400(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request)
+            return httpx.Response(400)
 
         client = SearXNGClient(
             base_url="http://localhost:8080",
             timeout=0.1,
             max_retries=3,
             retry_backoff_s=0.0,
+            transport=httpx.MockTransport(handle),
         )
+        self.addCleanup(client.close)
 
-        with self.assertRaises(requests.HTTPError):
+        with self.assertRaises(WebSearchError) as raised:
             client.search("query", limit=5)
 
-        self.assertEqual(get_mock.call_count, 1)
+        self.assertEqual(raised.exception.category, "http_error")
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

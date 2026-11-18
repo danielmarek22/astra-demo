@@ -1,4 +1,6 @@
+from tests.support import buffered_generation
 import unittest
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -160,6 +162,14 @@ class FakeLLM:
     def resolve_think_value(self, think_override=None):
         return True if think_override is None else think_override
 
+    def chat_buffered_result(self, messages, think_override=None, tools=None, **kwargs):
+        if kwargs.get("generation_phase") == "recovery":
+            self.calls.append((messages, think_override))
+            if self.error is not None:
+                raise self.error
+            return buffered_generation({"content": "".join(self.chunks)})
+        return buffered_generation(self.chat(messages, think_override=think_override, tools=tools))
+
     def chat_buffered(self, messages, think_override=None, tools=None, **kwargs):
         return self.chat(messages, think_override=think_override, tools=tools)
 
@@ -186,9 +196,12 @@ class BufferedPhaseLLM:
     def resolve_think_value(self, override=None):
         return self.configured_think if override is None else override
 
-    def chat_buffered(self, **kwargs):
+    def generation_options(self, _think=None, override=None):
+        return {"num_ctx": 32768, "num_predict": 2048, **(override or {})}
+
+    def chat_buffered_result(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        return buffered_generation(self.responses.pop(0))
 
     def chat(self, **_kwargs):
         raise AssertionError("buffered ReAct path expected")
@@ -252,6 +265,53 @@ class FakeMemoryPolicy:
 class OrchestratorTests(unittest.TestCase):
     SESSION_ID = "session-1"
 
+    def test_profile_overrides_reach_the_same_engine_without_extra_model_calls(self):
+        from app.core.execution_state import ExecutionProfile, ExecutionProfileOverrides
+
+        for enabled in (False, True):
+            with self.subTest(reasoning=enabled):
+                built = self._build_orchestrator(late_routing_enabled=True, summary_trigger=999)
+                orch = built[0]
+                orch.reasoning_enabled = enabled
+                orch.execution_profiles = {ExecutionProfile.DEEP: ExecutionProfileOverrides(
+                    max_inference_steps=3, generation_deadline_s=45.0, context_window_tokens=16384, num_predict=1024,
+                )}
+                model = BufferedPhaseLLM([
+                    {"tool_calls": [{"function": {"name": "shell__execute", "arguments": {"command": "test"}}}]},
+                    {"content": "Done"},
+                ])
+                orch.llm = model
+                events = list(orch.handle_user_input(self.SESSION_ID, "Question", execution_profile="deep"))
+                self.assertEqual(len(model.calls), 2)
+                self.assertEqual(len(built[6].calls), 1)
+                for call in model.calls:
+                    self.assertEqual(call["options_override"], {"num_ctx": 16384, "num_predict": 1024})
+                    self.assertEqual(call["generation_deadline_s"], 45.0)
+                    self.assertEqual(call["timeout_override"], 45.0)
+                    self.assertTrue(call["think_override"])
+                    self.assertEqual(any(item["function"]["name"] == "reasoning__continue"
+                                         for item in call["tools"]), enabled)
+                final = [event.text for event in events if isinstance(event, AssistantSpeechEvent) and event.is_final]
+                self.assertEqual(final, ["Done"])
+                self.assertEqual(orch._response_generator().execution_settings.profile, ExecutionProfile.STANDARD)
+
+    def test_default_profile_and_recovery_limits_resolve_without_mutating_shared_settings(self):
+        from app.core.execution_state import ExecutionProfile, ExecutionProfileOverrides
+
+        orch = self._build_orchestrator()[0]
+        orch.execution_profile = ExecutionProfile.DEEP
+        orch.execution_profiles = {ExecutionProfile.DEEP: ExecutionProfileOverrides(
+            recovery_num_predict=64, recovery_deadline_s=12.0, correction_num_predict=128,
+        )}
+        selected = orch._response_generator()
+        standard = orch._response_generator("standard")
+        self.assertEqual(selected.recovery_num_predict, 64)
+        self.assertEqual(selected.recovery_deadline_s, 12.0)
+        self.assertEqual(selected.correction_num_predict, 128)
+        self.assertEqual(standard.recovery_num_predict, 192)
+        self.assertEqual(standard.correction_num_predict, 512)
+        self.assertEqual(orch.recovery_num_predict, 192)
+
     def _build_orchestrator(
         self,
         llm_chunks=None,
@@ -310,6 +370,71 @@ class OrchestratorTests(unittest.TestCase):
         )
         return orch, llm, history, memory, summary_store, summarizer, tool_executor, context_builder
 
+    def test_web_source_footer_is_saved_and_final_only_and_does_not_leak_to_next_turn(self):
+        built = self._build_orchestrator(late_routing_enabled=True, summary_trigger=999, chat_responses=[
+            {"tool_calls": [{"function": {"name": "web__open", "arguments": {"target": "https://example.org/guide"}}}]},
+            {"content": "Supported answer."}, {"content": "Next answer."},
+        ])
+        built[6].results = [ToolResult.success(json.dumps({
+            "kind": "page_excerpt", "final_url": "https://example.org/guide", "title": "Guide", "excerpt": "Fact",
+        }))]
+        events = list(built[0].handle_user_input(self.SESSION_ID, "Read this"))
+        final = next(event.text for event in events if isinstance(event, AssistantSpeechEvent) and event.is_final)
+        self.assertIn("Supported answer.", final)
+        self.assertIn("[Guide](<https://example.org/guide>) — Page opened", final)
+        self.assertEqual(built[2].records[-1][2], final)
+        spoken = "".join(event.text for event in events if isinstance(event, AssistantSpeechEvent) and not event.is_final)
+        self.assertEqual(spoken, "Supported answer.")
+        next_events = list(built[0].handle_user_input(self.SESSION_ID, "Continue"))
+        next_final = next(event.text for event in next_events if isinstance(event, AssistantSpeechEvent) and event.is_final)
+        self.assertEqual(next_final, "Next answer.")
+        self.assertEqual(len(built[1].chat_calls), 3)
+
+    def test_provider_outage_footer_records_no_sources_without_new_model_calls(self):
+        built = self._build_orchestrator(late_routing_enabled=True, summary_trigger=999, chat_responses=[
+            {"tool_calls": [{"function": {"name": "web__search", "arguments": {"query": "Robotics"}}}]},
+            {"content": "Search is unavailable."},
+        ])
+        built[6].results = [ToolResult.success(json.dumps({
+            "kind": "search_results", "results": [], "provider_failure_count": 3,
+        }), diagnostics={"suppress_for_turn": True})]
+        events = list(built[0].handle_user_input(self.SESSION_ID, "Search"))
+        final = next(event.text for event in events if isinstance(event, AssistantSpeechEvent) and event.is_final)
+        self.assertIn("No live sources were retrieved for this turn.", final)
+        self.assertEqual(len(built[1].chat_calls), 2)
+
+    def test_unexecuted_batch_call_cannot_add_source_footer_urls(self):
+        built = self._build_orchestrator(late_routing_enabled=True, summary_trigger=999, chat_responses=[
+            {"tool_calls": [
+                {"function": {"name": "shell__execute", "arguments": {"command": "pwd"}}},
+                {"function": {"name": "web__open", "arguments": {"target": "https://example.org/unexecuted"}}},
+            ]}, {"content": "Finished."},
+        ])
+        events = list(built[0].handle_user_input(self.SESSION_ID, "Check"))
+        final = next(event.text for event in events if isinstance(event, AssistantSpeechEvent) and event.is_final)
+        self.assertEqual(final, "Finished.")
+        self.assertEqual(len(built[6].calls), 1)
+
+    def test_recovery_gets_retrieved_source_footer_but_deterministic_failure_stays_retryable(self):
+        for recovered in ("Recovered answer.", "   "):
+            with self.subTest(recovered=recovered):
+                built = self._build_orchestrator(late_routing_enabled=True, summary_trigger=999,
+                    llm_chunks=[recovered], chat_responses=[
+                        {"tool_calls": [{"function": {"name": "web__open", "arguments": {"target": "https://example.org/guide"}}}]},
+                        {"content": ""},
+                    ])
+                built[6].results = [ToolResult.success(json.dumps({
+                    "kind": "page_excerpt", "final_url": "https://example.org/guide", "title": "Guide",
+                }))]
+                events = list(built[0].handle_user_input(self.SESSION_ID, "Read"))
+                final = [event.text for event in events if isinstance(event, AssistantSpeechEvent) and event.is_final]
+                if recovered.strip():
+                    self.assertIn("https://example.org/guide", final[0])
+                else:
+                    self.assertEqual(final, [])
+                    self.assertTrue(any(isinstance(event, AssistantTurnFailureEvent) for event in events))
+                    self.assertFalse(any(row[1] == "assistant" for row in built[2].records))
+
     def test_scratchpad_recall_once_per_turn_including_instant_and_tool_loop(self):
         from unittest.mock import Mock
         for instant in (False, True):
@@ -330,6 +455,23 @@ class OrchestratorTests(unittest.TestCase):
                 provider.context_for_turn.assert_called_once_with(self.SESSION_ID, "Project Kite", 1)
                 self.assertIn("Project Kite", built[7].calls[0]["scratchpad_context"])
                 self.assertEqual(len(built[1].chat_calls), 0 if instant else 2)
+
+    def test_oversized_current_input_has_an_explicit_retry_failure_without_model_inference(self):
+        from app.core.prompt_budget import PromptBudget
+
+        for routed in (False, True):
+            with self.subTest(routed=routed):
+                built = self._build_orchestrator(summary_trigger=999, late_routing_enabled=routed)
+                built[0].prompt_budget = PromptBudget(context_window_tokens=4000, completion_reserve_tokens=256,
+                                                     safety_margin_tokens=128)
+                built[1].generation_options = lambda *_arguments: {"num_ctx": 4000, "num_predict": 256}
+                events = list(built[0].handle_user_input(self.SESSION_ID, "long input " * 5000))
+                failure = next(event for event in events if isinstance(event, AssistantTurnFailureEvent))
+                self.assertIn("context budget", failure.message)
+                self.assertEqual(len([record for record in built[2].records if record[1] == "user"]), 1)
+                self.assertFalse(any(record[1] == "assistant" for record in built[2].records))
+                self.assertFalse(built[1].calls)
+                self.assertFalse(built[1].chat_calls)
 
     def test_scratchpad_event_recall_requires_explicit_read_or_search_permission(self):
         from unittest.mock import Mock
@@ -921,11 +1063,14 @@ class OrchestratorTests(unittest.TestCase):
             def resolve_think_value(self, think_override=None):
                 return True if think_override is None else think_override
 
-            def chat_buffered(self, **kwargs):
+            def chat_buffered_result(self, **kwargs):
+                if kwargs.get("generation_phase") == "recovery":
+                    self.stream_calls.append((kwargs["messages"], kwargs))
+                    raise TimeoutError("recovery timed out")
                 self.calls.append(kwargs)
                 if not self.responses:
                     raise TimeoutError("recovery timed out before first chunk")
-                return self.responses.pop(0)
+                return buffered_generation(self.responses.pop(0))
 
             def chat(self, **_kwargs):
                 raise AssertionError("buffered ReAct path expected")
@@ -979,11 +1124,14 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual([call["react_iteration"] for call in client.calls], [1, 2])
         recovery_messages, recovery_kwargs = client.stream_calls[0]
-        self.assertEqual(len(recovery_messages), 2)
-        self.assertEqual(recovery_messages[-1], {
+        self.assertEqual(len(recovery_messages), 5)
+        self.assertEqual(recovery_messages[-3], {
             "role": "user", "content": "my current activity is testing"
         })
-        self.assertIn("Latest tool observation", recovery_messages[0]["content"])
+        self.assertEqual(recovery_messages[-2]["role"], "assistant")
+        self.assertEqual(recovery_messages[-1]["role"], "tool")
+        self.assertIn("second rejection", recovery_messages[-1]["content"])
+        self.assertNotIn("second rejection", recovery_messages[0]["content"])
         self.assertFalse(recovery_kwargs["think_override"])
         self.assertEqual(recovery_kwargs["options_override"], {"num_predict": 192})
         self.assertEqual(recovery_kwargs["generation_deadline_s"], 180.0)

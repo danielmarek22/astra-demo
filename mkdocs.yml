@@ -1,14 +1,117 @@
 site_name: Astra Demo
-site_description: A standalone showcase of local conversation, memory, beliefs, speech, screen context and tools.
+site_description: Setup, architecture, and development documentation for the standalone Astra demo.
+site_author: Astra Demo
+site_url: !ENV ASTRA_DOCS_SITE_URL
+repo_name: danielmarek22/astra-demo
+repo_url: https://github.com/danielmarek22/astra-demo
+docs_dir: docs
+site_dir: site
+
 theme:
   name: material
+  language: en
+  icon:
+    logo: material/book-open-page-variant
+    repo: fontawesome/brands/github
   palette:
-    primary: teal
-    accent: light green
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: astra-light
+      primary: deep-purple
+      accent: cyan
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+
 nav:
   - Home: index.md
-  - Architecture: architecture.md
-  - Development: development.md
-  - Validation: validation.md
-  - Capability decisions: capability-analysis.md
-  - Planning record: implementation-plan.md
+  - Getting started: getting-started.md
+  - Project map:
+      - System map: project-map.md
+      - Where do I change...?: guides/where-to-change.md
+  - Architecture:
+      - Overview: architecture.md
+      - Runtime lifecycle: architecture/runtime.md
+      - Context construction: architecture/context-building.md
+      - Web access: architecture/web-access.md
+      - Memory: architecture/memory.md
+      - Beliefs: architecture/beliefs.md
+  - Development:
+      - Working on the demo: development.md
+      - Documentation: guides/documentation.md
+  - Services:
+      - Service catalog: services/index.md
+      - Speech: services/speech.md
+      - MCP connections: services/mcp.md
+  - Roadmap: roadmap.md
+  - Reference:
+      - Validation: validation.md
+      - Capability decisions: capability-analysis.md
+      - Planning record: implementation-plan.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+plugins:
+  - search
+
+extra_css:
+  - assets/stylesheets/astra.css
+
+extra_javascript:
+  - assets/javascripts/diagram-viewer.js
+
+extra:
+  generator: false
+
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn

@@ -30,6 +30,9 @@ class ToolExecutor:
         self.operation_store = operation_store
         self.telemetry = telemetry
 
+    def capture_tool_catalog(self):
+        return self.registry.capture_tool_catalog()
+
     def get_native_tools(
         self,
         allowed_capabilities: set[CapabilityId] | frozenset[CapabilityId] | None = None,
@@ -38,6 +41,7 @@ class ToolExecutor:
         user_text: str = "",
         authoritative_turn=None,
         prepared_belief_turn=None,
+        tool_catalog=None,
     ) -> list[dict]:
         return self.registry.get_native_tools(
             allowed_capabilities,
@@ -46,6 +50,7 @@ class ToolExecutor:
                 user_text=user_text,
                 authoritative_turn=authoritative_turn,
                 prepared_belief_turn=prepared_belief_turn,
+                tool_catalog=tool_catalog,
             ),
         )
 
@@ -71,88 +76,102 @@ class ToolExecutor:
         authoritative_turn=None,
         prepared_belief_turn=None,
         allowed_capabilities: frozenset[CapabilityId] | None = None,
+        tool_catalog=None,
     ) -> Generator[AssistantStateEvent, None, ToolResult]:
         if allowed_capabilities is not None:
             allowed_capabilities = frozenset(allowed_capabilities)
-        yield AssistantStateEvent(state=AssistantState.SEARCHING)
-        capability = str(call.capability)
-        logger.info("Running capability '%s'", capability)
-        start_ts = time.perf_counter()
-        invocation_id = str(uuid.uuid4())
+        owns_catalog = tool_catalog is None
+        tool_catalog = tool_catalog if tool_catalog is not None else self.capture_tool_catalog()
+        try:
+            try:
+                private_logs = self.registry.redact_tool_logs(call.capability, tool_catalog)
+            except ValueError:
+                # Invalid snapshots are denied by invoke and still journaled safely.
+                private_logs = True
+            yield AssistantStateEvent(state=AssistantState.SEARCHING)
+            capability = str(call.capability)
+            logger.info("Running capability '%s'", capability)
+            start_ts = time.perf_counter()
+            invocation_id = str(uuid.uuid4())
 
-        typed_approval_callback = None
-        if approval_callback is not None:
-            def typed_approval_callback(request: ApprovalRequest) -> bool:
-                return approval_callback(request.to_payload())
+            typed_approval_callback = None
+            if approval_callback is not None:
+                def typed_approval_callback(request: ApprovalRequest) -> bool:
+                    return approval_callback(request.to_payload())
 
-        trace_event(
-            "tool_executor",
-            "tool_call",
-            session_id=session_id,
-            payload={
-                "tool": capability,
-                "arguments": dict(call.arguments),
-            },
-        )
-
-        if self.operation_store is not None:
-            self.operation_store.begin_operation(
-                invocation_id=invocation_id,
-                capability=capability,
+            trace_event(
+                "tool_executor",
+                "tool_call",
                 session_id=session_id,
-                event_id=event_id,
-                root_event_id=root_event_id,
-                causation_id=causation_id,
+                payload={
+                    "tool": capability,
+                    "arguments": {"redacted": True} if private_logs else dict(call.arguments),
+                },
             )
 
-        result = self.registry.invoke(
-            call,
-            InvocationContext(
-                session_id=session_id,
-                user_text=user_text,
-                approval_callback=typed_approval_callback,
-                invocation_id=invocation_id,
-                event_id=event_id,
-                root_event_id=root_event_id,
-                causation_id=causation_id,
-                notification_callback=notification_callback,
-                authoritative_turn=authoritative_turn,
-                prepared_belief_turn=prepared_belief_turn,
-                allowed_capabilities=allowed_capabilities,
-            ),
-        )
-        if result.status == ToolResultStatus.PENDING and result.operation_id != invocation_id:
-            logger.error("Capability %s returned an unexpected operation ID", capability)
-            result = ToolResult.error(
-                f"Capability returned an invalid asynchronous operation ID: {capability}"
+            if self.operation_store is not None:
+                self.operation_store.begin_operation(
+                    invocation_id=invocation_id,
+                    capability=capability,
+                    session_id=session_id,
+                    event_id=event_id,
+                    root_event_id=root_event_id,
+                    causation_id=causation_id,
+                )
+
+            result = self.registry.invoke(
+                call,
+                InvocationContext(
+                    session_id=session_id,
+                    user_text=user_text,
+                    approval_callback=typed_approval_callback,
+                    invocation_id=invocation_id,
+                    event_id=event_id,
+                    root_event_id=root_event_id,
+                    causation_id=causation_id,
+                    notification_callback=notification_callback,
+                    authoritative_turn=authoritative_turn,
+                    prepared_belief_turn=prepared_belief_turn,
+                    allowed_capabilities=allowed_capabilities,
+                    tool_catalog=tool_catalog,
+                ),
             )
-        if self.operation_store is not None:
-            self.operation_store.finish_operation(
-                invocation_id,
+            if result.status == ToolResultStatus.PENDING and result.operation_id != invocation_id:
+                logger.error("Capability %s returned an unexpected operation ID", capability)
+                result = ToolResult.error(
+                    f"Capability returned an invalid asynchronous operation ID: {capability}"
+                )
+            if self.operation_store is not None:
+                self.operation_store.finish_operation(
+                    invocation_id,
+                    result.status.value,
+                    result.content,
+                )
+
+            duration_ms = (time.perf_counter() - start_ts) * 1000
+            if self.telemetry is not None:
+                self.telemetry.record_tool_duration(duration_ms, session_id=session_id)
+            logger.info(
+                "Capability '%s' completed (status=%s, duration=%.2f ms)",
+                capability,
                 result.status.value,
-                result.content,
+                duration_ms,
             )
-
-        duration_ms = (time.perf_counter() - start_ts) * 1000
-        if self.telemetry is not None:
-            self.telemetry.record_tool_duration(duration_ms, session_id=session_id)
-        logger.info(
-            "Capability '%s' completed (status=%s, duration=%.2f ms)",
-            capability,
-            result.status.value,
-            duration_ms,
-        )
-        trace_event(
-            "tool_executor",
-            "tool_result",
-            session_id=session_id,
-            payload={
-                "tool": capability,
-                "status": result.status.value,
-                "content": result.content,
-            },
-        )
-        for effect in result.effects:
-            if isinstance(effect, AvatarOutfitEffect):
-                yield AvatarOutfitEvent(outfit=effect.outfit, url=effect.url)
-        return result
+            trace_event(
+                "tool_executor",
+                "tool_result",
+                session_id=session_id,
+                payload={
+                    "tool": capability,
+                    "status": result.status.value,
+                    "content": "[redacted]" if private_logs else result.content,
+                    **({"diagnostics": result.diagnostics} if private_logs else {}),
+                },
+            )
+            for effect in result.effects:
+                if isinstance(effect, AvatarOutfitEffect):
+                    yield AvatarOutfitEvent(outfit=effect.outfit, url=effect.url)
+            return result
+        finally:
+            if owns_catalog:
+                tool_catalog.close()

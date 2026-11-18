@@ -3,6 +3,7 @@ import { readEvents } from './js/demo-client.mjs';
 import { AudioManager } from './js/audio-manager.js';
 import { MicrophoneRecorder } from './js/microphone-recorder.mjs';
 import { ScreenCapture } from './js/screen-capture.mjs';
+import { MCPManager } from './js/mcp-manager.mjs';
 import { isImageFile, extractBase64Payload, extractImageFilesFromDataTransfer } from './js/attachment-utils.mjs';
 
 const $ = (id) => document.getElementById(id);
@@ -27,6 +28,29 @@ let speechEpoch = 0;
 let speechRequest = null;
 let approvalId = null;
 const audioUrls = new Set();
+let mcpWorkspace = null;
+const mcpHeaders = {'X-Astra-MCP-Client': '1'};
+const mcp = new MCPManager({
+    async getMCP() {
+        const requestedGeneration = generation;
+        const state = await api('/api/mcp', {headers: mcpHeaders});
+        if (generation !== requestedGeneration) throw new Error('The workspace changed. Reload MCP.');
+        mcpWorkspace = {generation: requestedGeneration, token: state.csrf_token};
+        return state;
+    },
+    async changeMCP(path, method, payload) {
+        if (!mcpWorkspace || mcpWorkspace.generation !== generation) {
+            throw new Error('The workspace changed. Reload MCP.');
+        }
+        const requestedGeneration = generation;
+        const state = await api(`/api/mcp${path}`, {
+            method, body: JSON.stringify(payload),
+            headers: {...mcpHeaders, 'X-Astra-MCP-Token': mcpWorkspace.token},
+        });
+        if (generation !== requestedGeneration) throw new Error('The workspace changed. Reload MCP.');
+        return state;
+    },
+});
 const audio = new AudioManager();
 const capture = new ScreenCapture((active) => {
     $('screen-preview').hidden = !active;
@@ -137,9 +161,12 @@ async function attachFiles(files) {
 }
 function showApproval(event) {
     approvalId = event.request_id;
-    $('approval-title').textContent = event.title || 'Allow this command?';
+    setView('chat');
+    $('approval-title').textContent = event.title || 'Allow this tool to run?';
     $('approval-reason').textContent = event.reason || '';
+    $('approval-detail-label').textContent = event.detail_label || '';
     $('approval-command').textContent = event.detail || '';
+    $('approval-shell-notice').hidden = event.tool !== 'shell__execute';
     $('approval').hidden = false;
     $('approve-command').disabled = false; $('deny-command').disabled = false;
     $('deny-command').focus();
@@ -172,7 +199,8 @@ async function api(path, options = {}) {
     }});
     if (!response.ok) {
         const error = await response.json();
-        throw new Error(typeof error.detail === 'string' ? error.detail : 'The request could not be completed.');
+        const message = typeof error.detail === 'string' ? error.detail : error.error?.message;
+        throw Object.assign(new Error(message || 'The request could not be completed.'), {status: response.status});
     }
     return response.json();
 }
@@ -181,13 +209,13 @@ function saveSelection() {
 }
 function setView(next) {
     view = next;
-    $('chat-view').hidden = next !== 'chat';
-    $('knowledge-view').hidden = next !== 'knowledge';
-    for (const name of ['chat', 'knowledge']) {
+    for (const name of ['chat', 'knowledge', 'mcp']) {
+        $(`${name}-view`).hidden = next !== name;
         $(`${name}-tab`).classList.toggle('active', next === name);
         $(`${name}-tab`).setAttribute('aria-pressed', String(next === name));
     }
     if (next === 'knowledge') loadKnowledge().catch(showError);
+    if (next === 'mcp') void mcp.reload();
 }
 function addMessage(role, text, row = {}) {
     const node = document.createElement('article');
@@ -339,9 +367,15 @@ async function loadKnowledge() {
 }
 async function synchronize(state) {
     if (!state.available) { generation = null; remoteBusy = false; controls(); throw new Error('The workspace is unavailable. Restart the demo server.'); }
-    if (generation !== state.generation) cancelMedia();
+    if (generation !== state.generation) {
+        cancelMedia();
+        mcpWorkspace = null;
+        mcp.clear();
+        if (view === 'mcp') setView('chat');
+    }
     capabilities = state.capabilities || {};
     generation = state.generation; remoteBusy = state.busy; examples = state.examples;
+    $('mcp-tab').hidden = !capabilities.mcp_management;
     $('model').textContent = state.model;
     $('examples').replaceChildren();
     examples.forEach((example, index) => {
@@ -377,6 +411,7 @@ $('new-chat').addEventListener('click', () => createConversation().catch(showErr
 $('suggestion-text').addEventListener('click', () => { $('message-input').value = $('suggestion-text').textContent; $('message-input').focus(); });
 $('chat-tab').addEventListener('click', () => setView('chat'));
 $('knowledge-tab').addEventListener('click', () => setView('knowledge'));
+$('mcp-tab').addEventListener('click', () => setView('mcp'));
 for (const button of document.querySelectorAll('[data-kind]')) button.addEventListener('click', () => {
     knowledgeKind = button.dataset.kind;
     document.querySelectorAll('[data-kind]').forEach((node) => node.classList.toggle('active', node === button));

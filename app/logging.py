@@ -33,9 +33,12 @@ TRACE_EVENT_CONVENTIONS: dict[str, tuple[str, ...]] = {
         "late_routing_observation",
         "late_routing_stream_complete",
         "late_routing_inference_timing",
+        "execution_completed",
         "late_routing_inference_failure",
         "belief_update_rejected",
         "forced_recovery",
+        "prompt_budget",
+        "prompt_budget_failure",
         "proactive_event",
     ),
     "context_builder": ("context_built",),
@@ -57,7 +60,7 @@ TRACE_EVENT_CONVENTIONS: dict[str, tuple[str, ...]] = {
         "search_request",
         "search_results",
         "tool_run",
-        "tool_summary",
+        "tool_results",
     ),
     "tool_executor": (
         "tool_call",
@@ -75,7 +78,6 @@ TRACE_EVENT_CONVENTIONS: dict[str, tuple[str, ...]] = {
         "summary_saved",
     ),
     "history_summarizer": ("summary_generated",),
-    "search_summarizer": ("summary_generated",),
     "image_summarizer": ("summary_generated",),
     "memory_store": (
         "memory_saved",
@@ -452,6 +454,16 @@ def trace_event(
     if fields:
         record["fields"] = fields
     if payload is not None:
+        # Replayed native thinking is still subject to the optional thinking
+        # logging setting. Redact a log-only copy, never the outgoing request.
+        if component == "llm" and event == "request_payload" and not _TRACE_INCLUDE_THINKING:
+            request = payload.get("request") if isinstance(payload, dict) else None
+            if isinstance(request, dict) and isinstance(request.get("messages"), list):
+                messages = [dict(message) for message in request["messages"]]
+                for message in messages:
+                    if message.get("role") == "assistant" and isinstance(message.get("thinking"), str):
+                        message["thinking"] = f"<omitted thinking len={len(message['thinking'])}>"
+                payload = {**payload, "request": {**request, "messages": messages}}
         record["payload"] = payload
 
     trace_logger.debug(serialize_for_debug(

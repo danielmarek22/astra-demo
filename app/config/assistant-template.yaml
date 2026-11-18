@@ -6,9 +6,13 @@ llm:
   generation:
     temperature: 0.6
     max_tokens: 768
-    num_ctx: 8192
+    num_ctx: 32768
   thinking:
     enabled: false
+execution:
+  default_profile: standard
+reasoning:
+  enabled: false
 local_human:
   id: demo-human
   display_name: Alex (sample participant)
@@ -43,8 +47,14 @@ autonomy:
 integrations:
   memory:
     enabled: true
+  history:
+    enabled: true
+    allow_all_sessions: false
   web:
     enabled: false
+  mcp:
+    enabled: false
+    servers: {}
   shell:
     enabled: true
     timeout: 15

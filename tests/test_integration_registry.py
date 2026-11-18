@@ -56,6 +56,12 @@ class FakeIntegration:
 
 
 class IntegrationRegistryTests(unittest.TestCase):
+    def test_reasoning_namespace_is_reserved_before_registering_handlers(self):
+        integration = FakeIntegration(name="reasoning")
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            IntegrationRegistry([integration])
+        self.assertEqual(integration.calls, [])
+
     def test_validation_feedback_uses_bounded_schema_hint_without_running_handler(self):
         integration = FakeIntegration()
         registered = integration.registered_tools()

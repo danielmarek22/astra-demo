@@ -1,11 +1,30 @@
-# Validation — 2026-10-15
+# Validation
+
+## Agent runtime refresh — 2026-11-18
+
+- The Python regressions and seven JavaScript test files passed. Critical lint,
+  the existing strict type-check scope, and the strict MkDocs build passed.
+- The standalone launcher used cached local embeddings, real SQLite and vector
+  stores, and loopback model and search fixtures. A turn searched and read the
+  seeded history from a new conversation. A web-assisted turn replayed the latest
+  native thinking, streamed a source link, and restored the same committed answer.
+- A local MCP echo server was added, connected, and refreshed through the demo API.
+  Its reviewed tool ran exactly once after approval in the turn stream. Reset
+  restored launch settings and rejected requests carrying the old workspace ID.
+- Headless Firefox loaded the MCP tab, saved a server, enabled the integration,
+  and restored the sample workspace at a 390-pixel viewport.
+- Live Ollama inference, hosted web services, and the isolated reader worker were
+  outside these smoke checks. The tests use local protocol fixtures for those
+  integration boundaries.
+
+## Standalone and media migration — 2026-10-15
 
 The standalone demo and speech/screen/shell migration were implemented on
 `codex/bootstrap-demo`. The implementation was committed on 2026-10-19, and public
 `main` is prepared as one fresh demo snapshot without inherited Astra commits.
 The checks below record the local demo environment and restored fictional samples.
 
-## Repository independence
+### Repository independence
 
 - Demo Git/common directory: `/home/bsh/astra-demo/.git`.
 - Original Git/common directory: `/home/bsh/local_ai_assistant/.git`.
@@ -19,7 +38,7 @@ The checks below record the local demo environment and restored fictional sample
   and provenance without publishing the original commit history; the development
   branch remains local. Historical validation statements below describe their check dates.
 
-## Deterministic checks
+### Deterministic checks
 
 | Check | Result |
 | --- | --- |
@@ -43,7 +62,7 @@ attachment regressions and add stop/cancellation/late-permission cleanup checks.
 The HTTP test client required local thread/event-loop communication outside the tool
 sandbox. Starlette emits an informational httpx TestClient deprecation warning.
 
-## Live speech, image and shell checks
+### Live speech, image and shell checks
 
 All migration observations used this demo's independent environment and server.
 No original Astra server was launched or modified.
@@ -74,7 +93,7 @@ Kokoro downloaded its official English spaCy model on first use. Ordinary Englis
 synthesis passed without a system espeak install; unusual pronunciation fallbacks
 have not been validated.
 
-## Browser validation boundary
+### Browser validation boundary
 
 Current browser automation was blocked by the browser URL policy when binding the
 localhost tab. No workaround was attempted. The new controls therefore have not had
@@ -84,12 +103,9 @@ tests does not establish audible playback in the user's browser.
 
 Earlier bootstrap checks verified text/memory recall and a native `memory__write`,
 then restored samples. The previous text-only layout was inspected at 1280×720 and
-390×844. The image below records that earlier layout; it predates the media controls.
-A fresh visual check belongs with the requested design pass.
+390×844.
 
-![Earlier bootstrap layout, before media controls](demo-preview.jpg)
-
-## Limits and deferred work
+### Limits and deferred work
 
 The shell implementation deliberately retains Astra's host execution policy. It is
 not a filesystem sandbox: some read commands run without approval, approved commands

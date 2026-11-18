@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from app.core.response_generator import (
     ResponseGenerator, inject_hidden_system_message, DEFAULT_GENERATION_DEADLINE_S,
-    DEFAULT_RECOVERY_DEADLINE_S, DEFAULT_RECOVERY_NUM_PREDICT, SAFE_EMPTY_RESPONSE_FALLBACK,
+    DEFAULT_RECOVERY_DEADLINE_S, DEFAULT_RECOVERY_NUM_PREDICT, DEFAULT_RECOVERY_OBSERVATION_CHARS,
+    SAFE_EMPTY_RESPONSE_FALLBACK,
 )
 from app.core.events import (
     AssistantSpeechEvent,
@@ -17,7 +18,11 @@ from app.core.events import (
     AutonomyOutcomeEvent,
 )
 from app.core.assistant_state import AssistantState
+from app.core.execution_state import (
+    ExecutionLimits, ExecutionProfile, ExecutionProfileOverrides, ExecutionSettings,
+)
 from app.core.turn_input import TurnInput, InputModality
+from app.core.prompt_budget import PromptBudgetError
 from app.core.turn_completion import AuthoritativeTurnContext
 from app.core.conversation import (
     InputSource,
@@ -28,6 +33,7 @@ from app.core.conversation import (
 from app.logging import trace_event
 from app.integrations import (
     CapabilityId,
+    ToolCatalogSnapshot,
     EventSpec,
     IntegrationEvent,
     NotificationDelivery,
@@ -38,6 +44,7 @@ from app.integrations import (
 from app.perception.attachments import Attachment, ImageAttachment
 from app.perception.state import PerceptionState
 from app.core.tool_executor import ToolExecutor
+from app.tools.web.answer_sources import RetrievedSources
 from app.perception.keys import PerceptionKey
 
 if TYPE_CHECKING:
@@ -83,6 +90,12 @@ class Orchestrator:
         avatar_wardrobe: "AvatarWardrobe | None" = None,
         scratchpad_context_provider=None,
         max_late_routing_steps: int = 5,
+        web_sources=None,
+        prompt_budget=None,
+        execution_profile: ExecutionProfile | str = ExecutionProfile.STANDARD,
+        execution_profiles: dict[ExecutionProfile, ExecutionProfileOverrides] | None = None,
+        reasoning_enabled: bool = False,
+        recovery_observation_chars: int = DEFAULT_RECOVERY_OBSERVATION_CHARS,
     ):
         self.llm = llm
         self.context_builder = context_builder
@@ -108,6 +121,7 @@ class Orchestrator:
         self.generation_deadline_s = max(1.0, float(generation_deadline_s))
         self.recovery_deadline_s = max(1.0, float(recovery_deadline_s))
         self.recovery_num_predict = max(1, int(recovery_num_predict))
+        self.recovery_observation_chars = max(1, int(recovery_observation_chars))
         self.telemetry = telemetry
         self._owned_resources = (database, vector_store)
         self._closed = False
@@ -115,6 +129,11 @@ class Orchestrator:
         self.belief_repository = belief_repository
         self.avatar_wardrobe = avatar_wardrobe
         self.max_late_routing_steps = max_late_routing_steps
+        self.web_sources = web_sources
+        self.prompt_budget = prompt_budget
+        self.execution_profile = ExecutionProfile(execution_profile)
+        self.execution_profiles = dict(execution_profiles or {})
+        self.reasoning_enabled = reasoning_enabled
         # The factory attaches the cyclic runtime after this constructor returns.
         self.autonomy_runtime: "AutonomyRuntime | None" = None
 
@@ -175,6 +194,7 @@ class Orchestrator:
         sender: SenderAttribution | None = None,
         session_kind: SessionKind | str | None = None,
         existing_user_message_id: int | None = None,
+        execution_profile: ExecutionProfile | str | None = None,
     ):
         start_ts = time.perf_counter()
         telemetry_handle = (
@@ -210,6 +230,9 @@ class Orchestrator:
         is_closing = False
         user_message_id: int | None = None
 
+        capture = getattr(self.tool_executor, "capture_tool_catalog", None)
+        candidate = capture() if callable(capture) else None
+        tool_catalog = candidate if isinstance(candidate, ToolCatalogSnapshot) else None
         try:
             logger.info(
                 "[%s] User input received (len=%d, images=%d, instant=%s)",
@@ -343,7 +366,7 @@ class Orchestrator:
                     logger.info("[%s] Instant mode enabled; late routing disabled", session_id)
                 else:
                     logger.info("[%s] Native late routing disabled; streaming response", session_id)
-                response = yield from self._response_generator().stream_response(
+                response = yield from self._response_generator(execution_profile).stream_response(
                     session_id,
                     messages,
                     think_override=turn_input.think_override,
@@ -367,7 +390,8 @@ class Orchestrator:
                             session_id,
                         )
                         prepared_belief_turn = None
-                response = yield from self._response_generator().stream_late_routed_response(
+                retrieved_sources = RetrievedSources()
+                response = yield from self._response_generator(execution_profile).stream_late_routed_response(
                     session_id=session_id,
                     messages=messages,
                     user_text=turn_input.user_text,
@@ -375,7 +399,11 @@ class Orchestrator:
                     authoritative_turn=authoritative_turn,
                     prepared_belief_turn=prepared_belief_turn,
                     initial_think_override=turn_input.think_override,
+                    retrieved_sources=retrieved_sources,
+                    **({"tool_catalog": tool_catalog} if tool_catalog is not None else {}),
                 )
+                if response and response.strip() and response != SAFE_EMPTY_RESPONSE_FALLBACK:
+                    response = retrieved_sources.append_to(response)
 
             if not response or not response.strip():
                 logger.warning(
@@ -474,7 +502,7 @@ class Orchestrator:
             if user_message_id is None:
                 raise
             logger.exception("[%s] Turn generation failed; exposing retry action", session_id)
-            failure_message = "Astra couldn't finish this response."
+            failure_message = str(exc) if isinstance(exc, PromptBudgetError) else "Astra couldn't finish this response."
             mark_failed = getattr(self.history, "mark_turn_failed", None)
             attempts = (
                 mark_failed(session_id, user_message_id, failure_message)
@@ -499,6 +527,8 @@ class Orchestrator:
             idle_emitted = True
             yield AssistantStateEvent(state=AssistantState.IDLE)
         finally:
+            if tool_catalog is not None:
+                tool_catalog.close()
             if self.telemetry is not None and not telemetry_ended:
                 self.telemetry.end_turn(
                     telemetry_handle,
@@ -618,6 +648,7 @@ class Orchestrator:
         spec: EventSpec,
         autonomy_context: str | None = None,
         tool_approval_callback: Callable[[dict], bool] | None = None,
+        execution_profile: ExecutionProfile | str | None = None,
     ):
         idle_emitted = False
         is_closing = False
@@ -630,6 +661,9 @@ class Orchestrator:
             notification = request
             return True
 
+        capture = getattr(self.tool_executor, "capture_tool_catalog", None)
+        candidate = capture() if callable(capture) else None
+        tool_catalog = candidate if isinstance(candidate, ToolCatalogSnapshot) else None
         try:
             yield AssistantStateEvent(state=AssistantState.THINKING)
             event_text = (
@@ -688,7 +722,7 @@ class Orchestrator:
             allowed = set(spec.allowed_capabilities)
             if spec.notification_policy != NotificationPolicy.NEVER_NOTIFY:
                 allowed.add(RuntimeIntegration.notify_capability)
-            response = yield from self._response_generator().stream_late_routed_response(
+            response = yield from self._response_generator(execution_profile).stream_late_routed_response(
                 session_id=session_id,
                 messages=messages,
                 user_text=event_text,
@@ -697,6 +731,7 @@ class Orchestrator:
                 event=event,
                 notification_callback=collect_notification,
                 persist_tool_traces=False,
+                **({"tool_catalog": tool_catalog} if tool_catalog is not None else {}),
             )
             summary = response.strip() or "Event processed without an internal summary."
             if spec.notification_policy == NotificationPolicy.ALWAYS_NOTIFY and notification is None:
@@ -717,6 +752,8 @@ class Orchestrator:
             is_closing = True
             raise
         finally:
+            if tool_catalog is not None:
+                tool_catalog.close()
             if not idle_emitted and not is_closing:
                 yield AssistantStateEvent(state=AssistantState.IDLE)
 
@@ -823,7 +860,16 @@ class Orchestrator:
             logger.exception("[%s] Integration context collection failed", session_id)
             return None
     
-    def _response_generator(self) -> ResponseGenerator:
+    def _response_generator(self, execution_profile: ExecutionProfile | str | None = None) -> ResponseGenerator:
+        profile = ExecutionProfile(execution_profile) if execution_profile is not None else self.execution_profile
+        base = ExecutionLimits(
+            max_inference_steps=self.max_late_routing_steps,
+            generation_deadline_s=self.generation_deadline_s,
+            recovery_deadline_s=self.recovery_deadline_s,
+            recovery_num_predict=self.recovery_num_predict,
+            recovery_observation_chars=self.recovery_observation_chars,
+        )
+        limits = self.execution_profiles.get(profile, ExecutionProfileOverrides()).resolve(base)
         return ResponseGenerator(
             self.llm, self.tool_executor, self.history.add,
             allowed_animations=self.allowed_animations,
@@ -832,4 +878,6 @@ class Orchestrator:
             generation_deadline_s=self.generation_deadline_s,
             recovery_deadline_s=self.recovery_deadline_s,
             recovery_num_predict=self.recovery_num_predict,
+            prompt_budget=self.prompt_budget,
+            execution_settings=ExecutionSettings(profile, limits, self.reasoning_enabled),
         )

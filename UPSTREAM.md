@@ -26,7 +26,7 @@ demo branch explicitly; do not push all branches or mirror this local repository
 
 ## Speech, screen and shell migration — 2026-10-15
 
-Source: the same baseline commit above. No later upstream revision is imported.
+Source for that migration: the same baseline commit above.
 The user selected migration of existing shell behavior, with hardening deferred to
 the main project. This supersedes the earlier sandbox-first proposal.
 
@@ -58,3 +58,22 @@ the demo acceptance checks.
 | Reviewed through | Imported after baseline | Validation |
 | --- | --- | --- |
 | `25377f547e60a0039e283c4cda162537e70e03a3` | None | See docs/validation.md |
+| `16e458d9fadc03fd4cb0cbc369966e7f9cccf577` | Selected changes from `9798140` through `16e458d` | See docs/validation.md |
+
+## Agent runtime refresh — 2026-11-18
+
+Ported the execution loop and atomic response handling (`2373c73`, `0199f1f`),
+native thinking continuation (`72fa0b1`), prompt and reasoning controls
+(`5409e30`, `431177a`, `145b53f`, `768949c`, `2af44bb`, `0f01fbe`),
+structured web tools, the isolated reader and source footer (`9798140`,
+`c88ee72`, `86e06a9`, `cc7f92b`), conversation history tools (`35d15be`),
+and MCP (`260b675` through `16e458d`).
+
+The demo composes these services in its own HTTP runtime. It retains its model,
+local state and media adapters. The template uses a 32K model context window to
+fit native continuations. The MCP tab writes a per-workspace copy of its settings.
+
+The demo documentation reuses the main Astra site's MkDocs layout, diagram
+viewer, and shared runtime guides. Startup, workspace lifecycle, and service
+guides describe the standalone deployment. The docs preview uses port 8003 so
+it can run alongside the main Astra docs preview.

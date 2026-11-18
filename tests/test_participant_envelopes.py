@@ -12,6 +12,7 @@ from app.core.context_builder import ContextBuilder
 from app.core.events import AssistantSpeechEvent
 from app.core.response_generator import ResponseGenerator
 from app.core.turn_finalizer import TurnFinalizer
+from tests.support import buffered_generation, rendered_step
 
 
 SENDER = SenderAttribution('astra', 'Astra', SenderType.LOCAL_ASSISTANT,
@@ -56,14 +57,14 @@ class ParticipantEnvelopeTests(unittest.TestCase):
 
     def test_streaming_and_buffered_paths_emit_and_return_clean_reply(self):
         wrapped = render_group_message('Hello there!', SENDER)
-        llm = Mock(spec=["chat_buffered", "stream_chat"])
+        llm = Mock(spec=["chat_buffered_result", "stream_chat"])
         llm.stream_chat.return_value = iter(wrapped)
-        llm.chat_buffered.return_value = {'content': wrapped}
+        llm.chat_buffered_result.return_value = buffered_generation({'content': wrapped})
         generator = ResponseGenerator(llm, SimpleNamespace(get_native_tools=lambda **kwargs: []), Mock())
         messages = [{'role': 'system', 'content': GROUP_CONTEXT_INSTRUCTION}]
         speech, result = consume(generator.stream_response('group', messages))
         self.assertEqual((speech, result), ('Hello there!', 'Hello there!'))
-        speech, result = consume(generator._stream_late_routing_step('group', messages, 'Hi'))
+        speech, result = consume(rendered_step(generator, 'group', messages, 'Hi'))
         self.assertEqual(speech, 'Hello there!')
         self.assertEqual(result.response, 'Hello there!')
 
@@ -84,13 +85,13 @@ class ParticipantEnvelopeTests(unittest.TestCase):
         for text in cases:
             for buffered in (False, True):
                 with self.subTest(text=text, buffered=buffered):
-                    llm = Mock(spec=['chat_buffered', 'stream_chat'])
+                    llm = Mock(spec=['chat_buffered_result', 'stream_chat'])
                     llm.stream_chat.return_value = iter(text)
-                    llm.chat_buffered.return_value = {'content': text}
+                    llm.chat_buffered_result.return_value = buffered_generation({'content': text})
                     generator = ResponseGenerator(
                         llm, SimpleNamespace(get_native_tools=lambda **kwargs: []), Mock(),
                     )
-                    response = (generator._stream_late_routing_step('group', messages, 'Hi')
+                    response = (rendered_step(generator, 'group', messages, 'Hi')
                                 if buffered else generator.stream_response('group', messages))
                     events = []
                     with self.assertRaises(AssistantEnvelopeError):
@@ -123,10 +124,10 @@ class ParticipantEnvelopeTests(unittest.TestCase):
 
     def test_direct_response_is_not_unwrapped(self):
         wrapped = render_group_message('Hello', SENDER)
-        llm = Mock(spec=["chat_buffered", "stream_chat"])
-        llm.chat_buffered.return_value = {'content': wrapped}
+        llm = Mock(spec=["chat_buffered_result", "stream_chat"])
+        llm.chat_buffered_result.return_value = buffered_generation({'content': wrapped})
         generator = ResponseGenerator(llm, SimpleNamespace(get_native_tools=lambda **kwargs: []), Mock())
-        _, result = consume(generator._stream_late_routing_step('direct', [], 'Hi'))
+        _, result = consume(rendered_step(generator, 'direct', [], 'Hi'))
         self.assertIn('PARTICIPANT_MESSAGE', result.response)
 
     def test_context_and_summary_normalize_saved_assistant_only(self):

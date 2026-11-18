@@ -1,5 +1,6 @@
 # Local environments, Python artifacts, and validation caches
 .venv/
+.venv-web/
 venv_app/
 **/__pycache__/
 *.py[cod]

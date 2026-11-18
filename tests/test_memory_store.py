@@ -38,7 +38,10 @@ class FakeCollection:
     def get(self, include=None):
         return {"ids": list(self.ids)}
 
-    def query(self, query_texts, n_results, where=None):
+    def count(self):
+        return len(self.ids)
+
+    def query(self, query_texts, n_results, where=None, include=None):
         # Fake search behavior: return everything we have up to n_results
         return {
             "ids": [self.ids[:n_results]] if self.ids else [[]],

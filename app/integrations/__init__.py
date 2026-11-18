@@ -18,9 +18,11 @@ from app.integrations.contracts import (
     ToolResult,
     ToolResultStatus,
     ToolSpec,
+    ToolCatalogSnapshot,
     ReplayPolicy,
 )
 from app.integrations.scratchpad import ScratchpadIntegration
+from app.integrations.history import HistoryIntegration
 from app.integrations.registry import IntegrationRegistry
 from app.integrations.beliefs import BeliefIntegration
 from app.integrations.builtins import MemoryIntegration, ShellIntegration, WebIntegration
@@ -53,12 +55,14 @@ __all__ = [
     "ToolResult",
     "ToolResultStatus",
     "ToolSpec",
+    "ToolCatalogSnapshot",
     "ReplayPolicy",
     "RuntimeIntegration",
     "MemoryIntegration",
     "MindcraftClient",
     "MindcraftIntegration",
     "ScratchpadIntegration",
+    "HistoryIntegration",
     "ShellIntegration",
     "WebIntegration",
     "VisionIntegration",

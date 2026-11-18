@@ -11,6 +11,7 @@ from app.core.conversation import (
     unwrap_assistant_envelope,
 )
 from app.logging import trace_event
+from app.core.prompt_budget import ContextSystemMessage
 from app.perception.attachments import (
     Attachment,
     AudioAttachment,
@@ -87,18 +88,15 @@ class ContextBuilder:
             summary = summary_record
             last_summarized_message_id = None
 
-        messages.append({
-            "role": "system",
-            "content": self._build_system_message(
-                now_local_iso=now_local.isoformat(),
-                memory_context=memory_context,
-                integration_context=integration_context,
-                belief_context=belief_context,
-                scratchpad_context=scratchpad_context,
-                summary=summary,
-                session_kind=session_kind,
-            ),
-        })
+        messages.append(self._build_system_message(
+            now_local_iso=now_local.isoformat(),
+            memory_context=memory_context,
+            integration_context=integration_context,
+            belief_context=belief_context,
+            scratchpad_context=scratchpad_context,
+            summary=summary,
+            session_kind=session_kind,
+        ))
 
         if memory_context or integration_context or belief_context:
             logger.info(
@@ -233,13 +231,15 @@ class ContextBuilder:
         summary: str | None,
         session_kind: SessionKind = SessionKind.DIRECT,
         scratchpad_context: str | None = None,
-    ) -> str:
+    ) -> ContextSystemMessage:
         sections = [
             self.system_prompt,
             f"Current system datetime (local): {now_local_iso}",
         ]
         if session_kind == SessionKind.MANUAL_GROUP:
             sections.append(GROUP_CONTEXT_INSTRUCTION)
+        mandatory = "\n\n---\n\n".join(section for section in sections if section)
+        sections = []
 
         # Assemble the background context internally
         combined_context_parts = []
@@ -274,7 +274,7 @@ class ContextBuilder:
         if summary:
             sections.append(f"Summary of previous conversation:\n{summary}")
 
-        return "\n\n---\n\n".join(section for section in sections if section)
+        return ContextSystemMessage(mandatory, sections)
 
     def _attach_multimodal_payloads(
         self,

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import re
+import json
 import uuid
-from dataclasses import dataclass, field
+import weakref
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol
+from types import MappingProxyType
 
 
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
@@ -140,8 +143,9 @@ class ToolResult:
         content: str,
         *,
         effects: tuple[AvatarOutfitEffect, ...] = (),
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> "ToolResult":
-        return cls(ToolResultStatus.SUCCESS, content, effects=effects)
+        return cls(ToolResultStatus.SUCCESS, content, effects=effects, diagnostics=diagnostics)
 
     @classmethod
     def error(
@@ -218,6 +222,7 @@ class InvocationContext:
     prepared_belief_turn: object | None = None
     # None is unrestricted application authority; an empty set permits no tools.
     allowed_capabilities: frozenset[CapabilityId] | None = None
+    tool_catalog: ToolCatalogSnapshot | None = None
 
     def __post_init__(self) -> None:
         if self.allowed_capabilities is not None:
@@ -242,6 +247,10 @@ class RegisteredTool:
     handler: ToolHandler
     available: AvailabilityCheck = True
     exposure_check: bool | Callable[[InvocationContext], bool] = True
+    enabled: bool = True
+    redact_logs: bool = False
+    # Optional connection generation retained for the lifetime of an admitted turn.
+    catalog_resource: Any = field(default=None, repr=False, compare=False)
 
     def is_available(self) -> bool:
         return bool(self.available() if callable(self.available) else self.available)
@@ -250,6 +259,60 @@ class RegisteredTool:
         if callable(self.exposure_check):
             return bool(self.exposure_check(context))
         return bool(self.exposure_check)
+
+
+@dataclass(frozen=True)
+class ToolCatalogSnapshot:
+    """Registry-owned definitions, copied on lookup; never execution authority."""
+
+    owner: object = field(repr=False)
+    revision: int
+    _entries: Mapping = field(repr=False)
+    _release: Any = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def capture(cls, owner, revision, tools):
+        entries = {
+            capability: (registered, json.dumps(dict(registered.spec.input_schema), allow_nan=False))
+            for capability, registered in tools.items()
+        }
+        resources = {id(tool.catalog_resource): tool.catalog_resource for tool in tools.values()
+                     if tool.catalog_resource is not None}
+        retained = []
+        try:
+            for resource in resources.values():
+                resource.retain()
+                retained.append(resource)
+        except Exception:
+            for resource in retained:
+                resource.release()
+            raise
+        snapshot = cls(owner, revision, MappingProxyType(entries))
+        object.__setattr__(snapshot, "_release", weakref.finalize(snapshot, cls._release_resources, retained))
+        return snapshot
+
+    @staticmethod
+    def _release_resources(resources):
+        for resource in resources:
+            resource.release()
+
+    def close(self):
+        if self._release is not None:
+            self._release()
+
+    @property
+    def closed(self):
+        return self._release is not None and not self._release.alive
+
+    def lookup(self, capability: CapabilityId) -> RegisteredTool | None:
+        entry = self._entries.get(capability)
+        if entry is None:
+            return None
+        registered, schema = entry
+        return replace(registered, spec=replace(registered.spec, input_schema=json.loads(schema)))
+
+    def tools(self) -> list[RegisteredTool]:
+        return [self.lookup(capability) for capability in sorted(self._entries)]
 
 
 class Integration(Protocol):

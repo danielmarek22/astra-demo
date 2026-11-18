@@ -1,15 +1,103 @@
 import unittest
+from copy import deepcopy
+import json
 from types import SimpleNamespace
-from unittest.mock import Mock, create_autospec
+from unittest.mock import Mock, create_autospec, patch
 
+from app.core.events import AssistantThinkingEvent
+from app.core.prompt_budget import PromptBudget, tool_groups
 from app.core.response_generator import ResponseGenerator
 from app.integrations import ToolResult
 from app.core.tool_executor import ToolExecutor
 from app.llm.base import LLMClient
-from tests.support import consume_generator as consume
+from app.llm.ollama_stream import OllamaClient
+from tests.support import consume_generator as consume, make_response
+from tests.support import BufferedResultMock, buffered_generation
 
 
 class ResponseGeneratorTests(unittest.TestCase):
+    def test_native_continuation_survives_second_http_payload_with_only_selected_call(self):
+        for guarded in (False, True):
+            for tracing in (False, True):
+                with self.subTest(guarded=guarded, tracing=tracing), \
+                        patch("app.logging._TRACE_INCLUDE_THINKING", tracing):
+                    client = OllamaClient("fixture", "http://localhost:11434", thinking_enabled=True,
+                                          options={"num_ctx": 32768, "num_predict": 2048})
+                    self.addCleanup(client.close)
+                    selected = {"function": {"name": "demo__run", "arguments": {"value": "żółć"}}}
+                    unexecuted = {"function": {"name": "demo__other", "arguments": {}}}
+                    thinking = 'Plan: inspect "żółć".\nThen answer.'
+                    preamble = "Checking the source."
+                    responses = iter([
+                        make_response(lines=[json.dumps(chunk).encode() for chunk in (
+                            {"message": {"thinking": thinking[:10]}, "done": False},
+                            {"message": {"thinking": thinking[10:], "content": "Checking "}, "done": False},
+                            {"message": {"content": "the source.", "tool_calls": [selected, unexecuted]}, "done": True},
+                        )]),
+                        make_response(lines=[json.dumps({"message": {"content": "Finished."}, "done": True}).encode()]),
+                    ])
+                    payloads = []
+
+                    def post(*_args, **kwargs):
+                        payloads.append(deepcopy(kwargs["json"]))
+                        return next(responses)
+
+                    client.session.post = Mock(side_effect=post)
+                    executed = []
+
+                    def execute(call, **_kwargs):
+                        executed.append(call)
+                        yield from ()
+                        return ToolResult.success("Observed result")
+
+                    trace = Mock()
+                    executor = SimpleNamespace(execute=execute, get_native_tools=lambda **_kwargs: [])
+                    generator = ResponseGenerator(client, executor, trace,
+                                                  prompt_budget=PromptBudget() if guarded else None)
+                    events, response = consume(generator.stream_late_routed_response(
+                        "session", [{"role": "user", "content": "Inspect the source"}], "Inspect the source"))
+                    self.assertEqual(response, "Finished.")
+                    self.assertEqual(len(payloads), 2)
+                    self.assertFalse(any(message.get("tool_calls") for message in payloads[0]["messages"]))
+                    replayed = next(message for message in payloads[1]["messages"] if message.get("tool_calls"))
+                    self.assertEqual(replayed, {"role": "assistant", "content": preamble,
+                                                "thinking": thinking, "tool_calls": [selected]})
+                    self.assertEqual(len(executed), 1)
+                    self.assertEqual(str(executed[0].capability), "demo__run")
+                    self.assertTrue(all(payload["think"] is True for payload in payloads))
+                    self.assertEqual(len(tool_groups(payloads[1]["messages"])), 1)
+                    self.assertEqual(sum(isinstance(event, AssistantThinkingEvent) and event.text == thinking
+                                         for event in events), 1)
+                    self.assertNotIn(thinking, str(trace.call_args_list))
+                    self.assertNotIn(preamble, str(trace.call_args_list))
+
+    def test_incomplete_native_stream_never_replays_partial_continuation_or_executes_call(self):
+        client = OllamaClient("fixture", "http://localhost:11434")
+        self.addCleanup(client.close)
+        responses = iter([
+            make_response(lines=[json.dumps({"message": {
+                "thinking": "Unfinished plan", "content": "Unfinished preamble",
+                "tool_calls": [{"function": {"name": "demo__run", "arguments": {}}}],
+            }, "done": False}).encode()]),
+            make_response(lines=[b'{"message":{"content":"Recovered."},"done":true}']),
+        ])
+        payloads = []
+
+        def post(*_args, **kwargs):
+            payloads.append(deepcopy(kwargs["json"]))
+            return next(responses)
+
+        client.session.post = Mock(side_effect=post)
+        executor = SimpleNamespace(execute=Mock(), get_native_tools=lambda **_kwargs: [])
+        events, response = consume(ResponseGenerator(client, executor, Mock()).stream_late_routed_response(
+            "session", [{"role": "user", "content": "Question"}], "Question"))
+        self.assertEqual(response, "Recovered.")
+        self.assertEqual(len(payloads), 2)
+        executor.execute.assert_not_called()
+        self.assertFalse(any(isinstance(event, AssistantThinkingEvent) for event in events))
+        self.assertFalse(any(message.get("tool_calls") for message in payloads[1]["messages"]))
+        self.assertNotIn("Unfinished", str(payloads[1]))
+
     def test_stream_controls_reach_model_without_signature_probing(self):
         llm = create_autospec(LLMClient, instance=True, spec_set=True)
         llm.stream_chat.return_value = iter(["Hello."])
@@ -29,7 +117,7 @@ class ResponseGeneratorTests(unittest.TestCase):
     def test_buffered_generation_receives_controls_and_discovery_context(self):
         llm = create_autospec(LLMClient, instance=True, spec_set=True)
         llm.resolve_think_value.return_value = "low"
-        llm.chat_buffered.return_value = {"content": "Finished."}
+        llm.chat_buffered_result.return_value = buffered_generation({"content": "Finished."})
         executor = create_autospec(ToolExecutor, instance=True, spec_set=True)
         executor.get_native_tools.return_value = []
         authority = object()
@@ -48,7 +136,7 @@ class ResponseGeneratorTests(unittest.TestCase):
             allowed_capabilities=frozenset(), session_id="session", user_text="Question",
             authoritative_turn=authority, prepared_belief_turn=prepared,
         )
-        llm.chat_buffered.assert_called_once_with(
+        llm.chat_buffered_result.assert_called_once_with(
             messages=messages, think_override="low", options_override=None, tools=[],
             timeout_override=42.0, generation_deadline_s=42.0,
             generation_phase="initial", react_iteration=1, telemetry_session_id="session",
@@ -66,14 +154,14 @@ class ResponseGeneratorTests(unittest.TestCase):
             consume(generator.stream_late_routed_response("session", [], "Question"))
         self.assertIs(raised.exception, error)
         executor.get_native_tools.assert_called_once()
-        llm.chat_buffered.assert_not_called()
+        llm.chat_buffered_result.assert_not_called()
         llm.chat.assert_not_called()
         executor.execute.assert_not_called()
 
     def test_omitted_memory_call_does_not_add_a_verification_inference(self):
         llm = SimpleNamespace(
             resolve_think_value=lambda override: True if override is None else override,
-            chat_buffered=Mock(side_effect=[
+            chat_buffered_result=BufferedResultMock(side_effect=[
                 {"content": "I'll remember that."},
             ]),
         )
@@ -87,7 +175,7 @@ class ResponseGeneratorTests(unittest.TestCase):
             "session", [], "Remember our project decision.",
         ))
         self.assertEqual(response, "I'll remember that.")
-        llm.chat_buffered.assert_called_once()
+        llm.chat_buffered_result.assert_called_once()
         executor.execute.assert_not_called()
 
     def test_native_loop_preserves_authority_and_records_only_tool_trace(self):
@@ -100,7 +188,7 @@ class ResponseGeneratorTests(unittest.TestCase):
             return ToolResult.success("Observed result")
         llm = SimpleNamespace(
             resolve_think_value=lambda override: True if override is None else override,
-            chat_buffered=Mock(side_effect=[
+            chat_buffered_result=BufferedResultMock(side_effect=[
                 {"content": "", "tool_calls": [{"function": {"name": "demo__run", "arguments": {}}}]},
                 {"content": "Finished."},
             ]),
@@ -118,15 +206,15 @@ class ResponseGeneratorTests(unittest.TestCase):
         trace = Mock()
         llm = SimpleNamespace(
             resolve_think_value=lambda override: True if override is None else override,
-            chat_buffered=Mock(side_effect=TimeoutError("late")),
+            chat_buffered_result=BufferedResultMock(side_effect=[TimeoutError("late"), {"content": "Recovered."}]),
             stream_chat=Mock(return_value=iter(["Recovered."])),
         )
         generator = ResponseGenerator(llm, SimpleNamespace(get_native_tools=lambda **kwargs: []), trace)
         _, response = consume(generator.stream_late_routed_response("session", [], "Question"))
         self.assertEqual(response, "Recovered.")
-        self.assertIs(llm.stream_chat.call_args.kwargs["think_override"], False)
-        self.assertEqual(llm.stream_chat.call_args.kwargs["options_override"], {"num_predict": 192})
-        self.assertEqual(llm.stream_chat.call_args.kwargs["generation_deadline_s"], 180.0)
-        self.assertEqual(llm.stream_chat.call_args.kwargs["timeout_override"], 180.0)
-        self.assertEqual(llm.stream_chat.call_args.kwargs["telemetry_session_id"], "session")
+        self.assertIs(llm.chat_buffered_result.call_args.kwargs["think_override"], False)
+        self.assertEqual(llm.chat_buffered_result.call_args.kwargs["options_override"], {"num_predict": 192})
+        self.assertEqual(llm.chat_buffered_result.call_args.kwargs["generation_deadline_s"], 180.0)
+        self.assertEqual(llm.chat_buffered_result.call_args.kwargs["timeout_override"], 180.0)
+        self.assertEqual(llm.chat_buffered_result.call_args.kwargs["telemetry_session_id"], "session")
         trace.assert_not_called()

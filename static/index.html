@@ -29,6 +29,7 @@
         <div class="view-switch" role="group" aria-label="Workspace view">
           <button id="chat-tab" class="active" aria-pressed="true">Conversation</button>
           <button id="knowledge-tab" aria-pressed="false">Knowledge</button>
+          <button id="mcp-tab" aria-pressed="false" hidden>MCP</button>
         </div>
       </header>
       <div class="sample-notice"><span class="notice-dot"></span><span>Fictional examples. Real assistant services. Explore a sample or start a conversation of your own.</span></div>
@@ -43,9 +44,10 @@
         <div id="messages" class="messages" role="log" aria-label="Messages"></div>
         <div class="composer-area">
           <div id="suggestion" class="suggestion" hidden><span>Try asking</span><button id="suggestion-text"></button></div>
-          <section id="approval" class="approval" role="region" aria-label="Command approval" aria-live="polite" hidden>
-            <strong id="approval-title"></strong><p id="approval-reason"></p><pre id="approval-command"></pre>
-            <p>Commands run on this computer using Astra’s existing approval rules.</p>
+          <section id="approval" class="approval" role="region" aria-label="Tool approval" aria-live="polite" hidden>
+            <strong id="approval-title"></strong><p id="approval-reason"></p>
+            <p id="approval-detail-label"></p><pre id="approval-command"></pre>
+            <p id="approval-shell-notice" hidden>Commands run on this computer using Astra’s existing approval rules.</p>
             <button id="deny-command" type="button">Deny</button> <button id="approve-command" type="button">Approve once</button>
           </section>
           <div id="screen-preview" class="screen-preview" hidden>
@@ -75,6 +77,42 @@
         <div class="knowledge-heading"><div class="eyebrow">CONTEXT YOU CAN INSPECT</div><h2>What’s remembered.<br>What’s believed.</h2><p>Saved memories preserve decisions and events. Beliefs track reported facts and their corrections.</p></div>
         <div class="knowledge-tabs" role="group" aria-label="Knowledge type"><button data-kind="memories" class="active">Saved memories</button><button data-kind="beliefs">Belief records</button><button data-kind="context">Current belief context</button></div>
         <div id="knowledge-records" aria-live="polite"></div>
+      </section>
+      <section id="mcp-view" class="knowledge-view" aria-label="External tools" hidden>
+        <div class="knowledge-heading">
+          <h2>External tools</h2>
+          <p>Connect an MCP server, refresh its catalog, and choose which tools Astra can use. Restore sample workspace resets these settings.</p>
+        </div>
+        <div class="mcp-toolbar">
+          <label><input id="mcp-enabled" type="checkbox" disabled> Enable MCP</label>
+          <button id="mcp-add" class="config-action-btn" type="button" disabled>Add server</button>
+          <button id="mcp-reload" class="config-action-btn" type="button">Reload</button>
+        </div>
+        <div id="mcp-status" role="status" aria-live="polite"></div>
+        <form id="mcp-server-form" class="mcp-card hidden">
+          <h3 id="mcp-form-title">Add server</h3>
+          <label>Server ID<input name="id" required maxlength="48" pattern="[a-z][a-z0-9_]*" autocomplete="off"></label>
+          <label>Description<input name="description" maxlength="512" autocomplete="off"></label>
+          <label><input name="enabled" type="checkbox"> Server enabled</label>
+          <label><input name="approval_required" type="checkbox" checked> Require execution approval by default</label>
+          <label>Transport<select name="transport"><option value="stdio">Local process (stdio)</option><option value="streamable_http">Streamable HTTP</option></select></label>
+          <div data-mcp-transport="stdio">
+            <label>Executable<input name="command" placeholder="/absolute/path/to/server" autocomplete="off"></label>
+            <label>Arguments (JSON array)<textarea name="args" rows="2"></textarea></label>
+            <label>Working directory<input name="cwd" placeholder="Optional absolute directory" autocomplete="off"></label>
+            <label>Environment references (JSON object)<textarea name="env" rows="2" placeholder='{"SERVICE_TOKEN":"ASTRA_SERVICE_TOKEN"}'></textarea></label>
+          </div>
+          <div data-mcp-transport="streamable_http" class="hidden">
+            <label>Server URL<input name="url" type="url" placeholder="http://127.0.0.1:3001/mcp" autocomplete="off"></label>
+            <label>Header references (JSON object)<textarea name="headers" rows="2" placeholder='{"Authorization":"ASTRA_MCP_AUTHORIZATION"}'></textarea></label>
+          </div>
+          <p class="mcp-help">Use environment-variable names for credentials.</p>
+          <details><summary>Execution and receive limits</summary>
+            <label>Limits (JSON object)<textarea name="limits" rows="3" placeholder='{"call_timeout_s":30}'></textarea></label>
+          </details>
+          <div class="mcp-actions"><button type="submit" class="config-action-btn">Save server</button><button id="mcp-cancel" type="button" class="config-action-btn">Cancel</button></div>
+        </form>
+        <div id="mcp-servers"></div>
       </section>
       <div id="error" class="error-banner" role="alert" hidden></div>
     </main>
