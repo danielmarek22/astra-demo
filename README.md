@@ -1,5 +1,7 @@
 # Astra Demo
 
+**[Visit the Astra Demo documentation site](https://danielmarek22.github.io/astra-demo/)**
+
 A standalone showcase of Astra’s local agent runtime, conversation history, memory,
 beliefs, speech, and screen context. Continue fictional projects, inspect saved
 knowledge, and restore the sample workspace whenever you want a clean start.
@@ -94,7 +96,6 @@ default. Run the original Astra on another port if you want both open at once.
 
 ## Documentation site
 
-Read the [published documentation](https://danielmarek22.github.io/astra-demo/).
 The demo application runs locally with Ollama.
 
 To preview the docs locally, run these commands from the repository root.
