@@ -18,6 +18,8 @@ from jsonschema.exceptions import ValidationError
 
 from app.config import MCPConfig
 
+_STOP_CONNECTION = object()
+
 
 def _private_sdk_logs(record: logging.LogRecord) -> bool:
     # SDK diagnostics can include received bodies, commands and exception values.
@@ -63,6 +65,7 @@ class MCPServerStatus:
 class _Connection:
     queue: asyncio.Queue
     task: asyncio.Task | None = None
+    stopping: bool = False
 
 
 def _safe_error(error: BaseException) -> MCPRuntimeError:
@@ -269,8 +272,8 @@ class MCPRuntime:
 
     def _cancel_connection(self, server_id: str) -> None:
         connection = self._connections.get(server_id)
-        if connection is not None and connection.task is not None:
-            connection.task.cancel()
+        if connection is not None and connection.task is not None and not connection.stopping:
+            connection.stopping = connection.task.cancel(_STOP_CONNECTION)
 
     async def _request(self, server_id: str, operation: str, payload=None):
         connection = self._connections.get(server_id)
@@ -417,6 +420,12 @@ class MCPRuntime:
                 call_started = False
                 current = await connection.queue.get()
         except BaseException as failure:  # noqa: BLE001 -- owner must resolve waiters and release contexts on cancellation
+            if isinstance(failure, asyncio.CancelledError) and failure.args == (_STOP_CONNECTION,):
+                task = asyncio.current_task()
+                if hasattr(task, "uncancel"):
+                    # The owner consumed this stop request. AnyIO distinguishes outstanding
+                    # native cancellation from cancellation of SDK task groups during exit.
+                    task.uncancel()
             error = (
                 auth_failed[0] if isinstance(auth_failed[0], MCPRuntimeError) else
                 MCPRuntimeError("authentication_failed", "MCP authentication was rejected; check the configured credentials.")
@@ -428,6 +437,7 @@ class MCPRuntime:
                 if getattr(failure, "code", None) == HEADER_MISMATCH:
                     error = MCPRuntimeError("schema_changed", "MCP tool schema was rejected before execution; refresh and review the catalog.")
         finally:
+            connection.stopping = True
             try:
                 with _deadline(spec.shutdown_timeout_s):
                     await stack.aclose()
@@ -457,9 +467,11 @@ class MCPRuntime:
                         response.set_result(None)
 
     async def _shutdown(self) -> None:
-        tasks = [item.task for item in self._connections.values() if item.task is not None and not item.task.done()]
-        for task in tasks:
-            task.cancel()
+        tasks = []
+        for server_id, connection in self._connections.items():
+            if connection.task is not None and not connection.task.done():
+                self._cancel_connection(server_id)
+                tasks.append(connection.task)
         if tasks:
             timeout = max(spec.shutdown_timeout_s for spec in self._settings.servers.values()) + 1
             _, pending = await asyncio.wait(tasks, timeout=timeout)
